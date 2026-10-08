@@ -262,8 +262,8 @@ launch_kernel_from_so(omp_sscp_executable_object::omp_sscp_kernel *kernel,
                       void **kernel_args) {
   // *** Do NOT change these values without changing also on the compiler side
   //     in host/StaticLocalMemoryPass.cpp ***
-  // for internal use in group algorithms
-  constexpr std::size_t internal_local_memory = 1024 * sizeof(uint64_t);
+  // for internal use: [0, 8K) group algorithms, [8K, 16K) sub-groups
+  constexpr std::size_t internal_local_memory = 2 * 1024 * sizeof(uint64_t);
   // for local memory global variables
   constexpr std::size_t static_local_mem_size = 1024 * 64 * sizeof(uint64_t);
   std::size_t total_internal_local_mem_size =
@@ -565,6 +565,11 @@ result omp_queue::submit_sscp_kernel_from_code_object(
   if(host_veclib.has_value())
     _config.set_build_option(kernel_build_option::host_vector_math_library,
         static_cast<int>(*host_veclib));
+
+  // Sub-group size becomes a JIT-time constant and part of the JIT cache key
+  // Kernels with different subgroup sizes will have different cache keys
+  _config.set_build_option(kernel_build_option::desired_subgroup_size,
+                           get_omp_subgroup_size());
 
   auto binary_configuration_id =
       adaptivity_engine.finalize_binary_configuration(_config);
