@@ -127,7 +127,7 @@ void replaceGVWithInternalLocalMem(llvm::GlobalVariable* GV, llvm::Module& M, st
 llvm::PreservedAnalyses HostStaticLocalMemoryPass::run(llvm::Module &M, llvm::ModuleAnalysisManager &AM) {
   // These parameters need to be aligned with the kernel call and allocation
   // the local memory block in omp_queue.cpp!
-  std::size_t Offset = 1024 * sizeof(uint64_t);
+  std::size_t Offset = 2 * 1024 * sizeof(uint64_t); // taking into account subgroup scratch of same size
   std::size_t MaxSize = 64 * sizeof(uint64_t) * 1024;
 
   for(llvm::GlobalVariable& GV : M.globals()) {

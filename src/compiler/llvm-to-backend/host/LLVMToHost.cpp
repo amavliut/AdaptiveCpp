@@ -173,6 +173,14 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
   if (!this->linkBitcodeFile(M, BuiltinBitcodeFile))
     return false;
 
+  // set subgroup size for llvm ir as a constant
+  if (auto *SgSize = M.getGlobalVariable(cbs::HostSubGroupSizeName)) {
+    SgSize->setInitializer(llvm::ConstantInt::get(
+        SgSize->getValueType(), DesiredSubgroupSize > 0 ? DesiredSubgroupSize : 1));
+    SgSize->setConstant(true);
+    SgSize->setLinkage(llvm::GlobalValue::InternalLinkage);
+  }
+
   // Internalize all constant global variables that don't their definition
   // to be imported from external sources - this is fine because llvm-to-backend
   // lowering always happens *after* linking in all dependencies, and therefore
@@ -183,17 +191,20 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
       GV.setLinkage(llvm::GlobalValue::LinkageTypes::InternalLinkage);
   }
 
-  if(auto* Barrier = M.getFunction("__acpp_cbs_barrier")) {
+  // Barriers must not be moved/dropped by the optimizations before CBS
+  for (const char *Name : {cbs::BarrierIntrinsicName, cbs::SubGroupBarrierIntrinsicName}) {
+    if (auto *Barrier = M.getFunction(Name)) {
 #if LLVM_VERSION_MAJOR >= 16
-    Barrier->setMemoryEffects(llvm::MemoryEffects::unknown());
+      Barrier->setMemoryEffects(llvm::MemoryEffects::unknown());
 #else
-    Barrier->removeFnAttr(llvm::Attribute::ReadNone);
-    Barrier->removeFnAttr(llvm::Attribute::ReadOnly);
-    Barrier->removeFnAttr(llvm::Attribute::WriteOnly);
-    Barrier->removeFnAttr(llvm::Attribute::ArgMemOnly);
-    Barrier->removeFnAttr(llvm::Attribute::InaccessibleMemOnly);
-    Barrier->removeFnAttr(llvm::Attribute::InaccessibleMemOrArgMemOnly);
+      Barrier->removeFnAttr(llvm::Attribute::ReadNone);
+      Barrier->removeFnAttr(llvm::Attribute::ReadOnly);
+      Barrier->removeFnAttr(llvm::Attribute::WriteOnly);
+      Barrier->removeFnAttr(llvm::Attribute::ArgMemOnly);
+      Barrier->removeFnAttr(llvm::Attribute::InaccessibleMemOnly);
+      Barrier->removeFnAttr(llvm::Attribute::InaccessibleMemOrArgMemOnly);
 #endif
+    }
   }
   
   HIPSYCL_DEBUG_INFO << "LLVMToHostTranslator: Done toBackendFlavor\n";
