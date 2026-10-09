@@ -1451,6 +1451,28 @@ getBarrierIds(llvm::BasicBlock *Entry, llvm::SmallPtrSetImpl<llvm::BasicBlock *>
   return Barriers;
 }
 
+// Barrier ids (existing numbering) plus the tier of each id. Entry/exit are WG.
+struct BarrierAnalysis {
+  llvm::DenseMap<llvm::BasicBlock *, size_t> Ids;
+  llvm::DenseMap<size_t, GroupTier> Tiers;
+
+  void classify(llvm::BasicBlock *Entry, llvm::SmallPtrSetImpl<llvm::BasicBlock *> &ExitingBlocks,
+                llvm::ArrayRef<llvm::BasicBlock *> Blocks, const SplitterAnnotationInfo &SAA) {
+    Ids = getBarrierIds(Entry, ExitingBlocks, Blocks, SAA);
+    for (auto &[BB, Id] : Ids) {
+      // Entry/exit stay WG via the lookup default (ExitBarrierId = -1 is DenseMap's empty key).
+      if (Id != EntryBarrierId && Id != ExitBarrierId)
+        Tiers[Id] = utils::getBarrierTier(BB);
+      HIPSYCL_DEBUG_INFO << "[SubCFG] Barrier " << BB->getName() << " id " << Id << " tier "
+                         << (tier(Id) == GroupTier::SubGroup ? "SG" : "WG") << "\n";
+    }
+  }
+
+  GroupTier tier(size_t Id) const {
+    return Id == ExitBarrierId ? GroupTier::WorkGroup : Tiers.lookup(Id);
+  }
+};
+
 void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
                  llvm::PostDominatorTree &PDT, const SplitterAnnotationInfo &SAA, bool IsSscp) {
   HIPSYCL_DEBUG_EXECUTE_VERBOSE(F.viewCFG();)
@@ -1489,7 +1511,9 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
     llvm_unreachable("[SubCFG] Invalid kernel! No kernel exits!\n");
   }
 
-  auto Barriers = getBarrierIds(Entry, ExitingBlocks, Blocks, SAA);
+  BarrierAnalysis BA;
+  BA.classify(Entry, ExitingBlocks, Blocks, SAA); // tiers have no consumer yet (Stage 4+)
+  const auto &Barriers = BA.Ids;
 
   const llvm::DataLayout &DL = F.getParent()->getDataLayout();
   auto *LastBarrierIdStorage =
