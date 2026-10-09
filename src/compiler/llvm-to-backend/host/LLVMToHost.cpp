@@ -254,7 +254,8 @@ bool LLVMToHostTranslator::translateToBackendFormat(llvm::Module &FlavoredModule
     });
     PB.registerModuleAnalyses(MAM);
 
-    registerCBSPipeline(MPM, hipsycl::compiler::OptLevel::O3, true);
+    registerCBSPipeline(MPM, hipsycl::compiler::OptLevel::O3, true,
+                        DesiredSubgroupSize > 0 ? DesiredSubgroupSize : 1);
     HIPSYCL_DEBUG_INFO << "LLVMToHostTranslator: Done registering\n";
 
     llvm::FunctionPassManager FPM;

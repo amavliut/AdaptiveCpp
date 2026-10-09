@@ -305,6 +305,24 @@ getVectorizationInfo(llvm::Function &F, hipsycl::compiler::Region &R, llvm::Loop
   return VecInfo;
 }
 
+// tags a work-item loop latch so LoopsParallelMarker treats the loop as parallel
+void markWorkItemLoop(llvm::Instruction *LatchTerm) {
+  auto &Ctx = LatchTerm->getContext();
+  auto *MDWorkItemLoop =
+      llvm::MDNode::get(Ctx, {llvm::MDString::get(Ctx, MDKind::WorkItemLoop)});
+  LatchTerm->setMetadata("llvm.loop",
+                         llvm::makePostTransformationMetadata(Ctx, nullptr, {}, {MDWorkItemLoop}));
+}
+
+// in case code references all dimensions, we need to set the remaining dimensions to 0
+void zeroUnusedLocalIds(llvm::Function &F, size_t Dim) {
+  for (size_t D = Dim; D < 3; ++D) {
+    auto ID = mergeGVLoadsInEntry(F, LocalIdGlobalNames[D]);
+    ID->replaceAllUsesWith(llvm::Constant::getNullValue(ID->getType()));
+    ID->eraseFromParent();
+  }
+}
+
 // create the wi-loops around a kernel or subCFG, LastHeader input should be the load block,
 // ContiguousIdx may be any identifyable value (load from undef)
 void createLoopsAround(llvm::Function &F, llvm::BasicBlock *AfterBB,
@@ -406,6 +424,73 @@ void createLoopsAround(llvm::Function &F, llvm::BasicBlock *AfterBB,
   ContiguousIdx = Idx;
 }
 
+// Small loop for a subsubCFG, same contract as createLoopsAround: one 1-D loop over a
+// sub-group's flattened local ids [sg*S, min(sg*S+S, WG)) (x fastest, as the full loop's
+// contiguous index), inside a loop over sub-groups. The sg loop is per span (temporary),
+// so every sub-group runs the span before the next span starts (same order as the full loop).
+void createSubGroupLoopsAround(llvm::Function &F, llvm::BasicBlock *AfterBB,
+                               llvm::ArrayRef<llvm::Value *> LocalSize, std::size_t SubgroupSize,
+                               int EntryId, llvm::ValueToValueMapTy &VMap,
+                               llvm::SmallVector<llvm::BasicBlock *, 3> &Latches,
+                               llvm::BasicBlock *&LastHeader, llvm::Value *&ContiguousIdx,
+                               bool IsSscp) {
+  auto &Ctx = F.getContext();
+  auto *SizeT = F.getParent()->getDataLayout().getLargestLegalIntType(Ctx);
+  const std::string Suffix = (".subcfg." + llvm::Twine{EntryId} + "b").str();
+  const size_t Dim = LocalSize.size();
+  auto *LoadBB = LastHeader;
+  auto *SgHeader = llvm::BasicBlock::Create(Ctx, "sg.header" + Suffix, &F, LoadBB);
+  auto *LaneHeader = llvm::BasicBlock::Create(Ctx, "lane.header" + Suffix, &F, LoadBB);
+  auto *LaneLatch = llvm::BasicBlock::Create(Ctx, "lane.latch" + Suffix, &F);
+  auto *SgLatch = llvm::BasicBlock::Create(Ctx, "sg.latch" + Suffix, &F);
+  auto *S = llvm::ConstantInt::get(SizeT, SubgroupSize);
+  auto *One = llvm::ConstantInt::get(SizeT, 1);
+
+  // sg header: lane range of this sub-group; the last one may be partial
+  llvm::IRBuilder<> B{SgHeader};
+  auto *Sg = B.CreatePHI(SizeT, 2, "sg" + Suffix);
+  Sg->addIncoming(llvm::ConstantInt::get(SizeT, 0), &F.getEntryBlock());
+  llvm::Value *WG = LocalSize[0];
+  for (size_t D = 1; D < Dim; ++D)
+    WG = B.CreateMul(WG, LocalSize[D], "wg.size" + Suffix);
+  auto *Begin = B.CreateMul(Sg, S, "sg.begin" + Suffix, true);
+  auto *End = B.CreateBinaryIntrinsic(llvm::Intrinsic::umin, B.CreateAdd(Begin, S), WG,
+                                      nullptr, "sg.end" + Suffix);
+  B.CreateBr(LaneHeader);
+
+  // lane header: the flattened local id; rebuild per-dimension ids (dimension Dim-1 fastest)
+  B.SetInsertPoint(LaneHeader);
+  auto *Lane = B.CreatePHI(SizeT, 2, "lane" + Suffix);
+  Lane->addIncoming(Begin, SgHeader);
+  llvm::Value *Rest = Lane;
+  for (int D = Dim - 1; D >= 0; --D) {
+    auto *IdLoad = mergeGVLoadsInEntry(F, LocalIdGlobalNames[IsSscp ? Dim - D - 1 : D]);
+    VMap[IdLoad] = D == 0 ? Rest : B.CreateURem(Rest, LocalSize[D]);
+    if (D > 0)
+      Rest = B.CreateUDiv(Rest, LocalSize[D]);
+  }
+  B.CreateBr(LoadBB);
+
+  // lane latch: next lane of this sub-group (work-item loop, like the full loop)
+  B.SetInsertPoint(LaneLatch);
+  auto *NextLane = B.CreateAdd(Lane, One, "lane.next" + Suffix, true);
+  Lane->addIncoming(NextLane, LaneLatch);
+  markWorkItemLoop(B.CreateCondBr(B.CreateICmpULT(NextLane, End), LaneHeader, SgLatch));
+
+  // sg latch: next sub-group while it starts inside the work-group
+  B.SetInsertPoint(SgLatch);
+  auto *NextSg = B.CreateAdd(Sg, One, "sg.next" + Suffix, true);
+  Sg->addIncoming(NextSg, SgLatch);
+  B.CreateCondBr(B.CreateICmpULT(B.CreateMul(NextSg, S), WG), SgHeader, AfterBB);
+
+  Latches = {SgLatch, LaneLatch}; // [0] = outermost, as createLoopsAround
+  VMap[AfterBB] = LaneLatch;      // span exits continue with the next lane
+  zeroUnusedLocalIds(F, Dim);
+  VMap[ContiguousIdx] = Lane;
+  ContiguousIdx = Lane;
+  LastHeader = SgHeader;
+}
+
 class SubCFG {
 
   using BlockVector = llvm::SmallVector<llvm::BasicBlock *, 8>;
@@ -476,7 +561,8 @@ public:
                  llvm::DenseMap<llvm::Instruction *, llvm::SmallVector<llvm::Instruction *, 8>>
                      &ContInstReplicaMap,
                  llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
-                 llvm::BasicBlock *AfterBB, llvm::ArrayRef<llvm::Value *> LocalSize, bool IsSscp);
+                 llvm::BasicBlock *AfterBB, llvm::ArrayRef<llvm::Value *> LocalSize, bool IsSscp,
+                 std::size_t SubgroupSize);
 
   void arrayifyMultiSubCfgValues(
       llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &InstAllocaMap,
@@ -597,7 +683,8 @@ void SubCFG::replicate(
     llvm::DenseMap<llvm::Instruction *, llvm::SmallVector<llvm::Instruction *, 8>>
         &ContInstReplicaMap,
     llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
-    llvm::BasicBlock *AfterBB, llvm::ArrayRef<llvm::Value *> LocalSize, bool IsSscp) {
+    llvm::BasicBlock *AfterBB, llvm::ArrayRef<llvm::Value *> LocalSize, bool IsSscp,
+    std::size_t SubgroupSize) {
   llvm::ValueToValueMapTy VMap;
 
   // clone blocks
@@ -620,7 +707,11 @@ void SubCFG::replicate(
   llvm::BasicBlock *LastHeader = LoadBB_;
   llvm::Value *Idx = ContIdx_;
 
-  createLoopsAround(F, AfterBB, LocalSize, EntryId_, VMap, Latches, LastHeader, Idx, IsSscp);
+  if (Tier_ == GroupTier::SubGroup) // subsubCFG: small loop over one sub-group's lanes
+    createSubGroupLoopsAround(F, AfterBB, LocalSize, SubgroupSize, EntryId_, VMap, Latches,
+                              LastHeader, Idx, IsSscp);
+  else
+    createLoopsAround(F, AfterBB, LocalSize, EntryId_, VMap, Latches, LastHeader, Idx, IsSscp);
 
   PreHeader_ = createUniformLoadBB(LastHeader);
   LastHeader->replacePhiUsesWith(&F.getEntryBlock(), PreHeader_);
@@ -1490,7 +1581,8 @@ GroupTier classifySpan(const SubCFG &Cfg, const BarrierAnalysis &BA) {
 }
 
 void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
-                 llvm::PostDominatorTree &PDT, const SplitterAnnotationInfo &SAA, bool IsSscp) {
+                 llvm::PostDominatorTree &PDT, const SplitterAnnotationInfo &SAA, bool IsSscp,
+                 std::size_t SubgroupSize) {
   HIPSYCL_DEBUG_EXECUTE_VERBOSE(F.viewCFG();)
 
   const std::size_t Dim = getRangeDim(F, IsSscp);
@@ -1570,7 +1662,7 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
   for (auto &Cfg : SubCFGs) {
     Cfg.print();
     Cfg.replicate(F, InstAllocaMap, BaseInstAllocaMap, InstContReplicaMap, RemappedInstAllocaMap,
-                  NewExit, LocalSize, IsSscp);
+                  NewExit, LocalSize, IsSscp, SubgroupSize);
     purgeLifetime(Cfg);
   }
 
@@ -1682,7 +1774,7 @@ bool SubCfgFormationPassLegacy::runOnFunction(llvm::Function &F) {
   auto &LI = getAnalysis<llvm::LoopInfoWrapperPass>().getLoopInfo();
 
   if (utils::hasBarriers(F, SAA))
-    formSubCfgs(F, LI, DT, PDT, SAA, false);
+    formSubCfgs(F, LI, DT, PDT, SAA, false, 1);
   else
     createLoopsAroundKernel(F, DT, LI, PDT, false);
 
@@ -1706,7 +1798,7 @@ llvm::PreservedAnalyses SubCfgFormationPass::run(llvm::Function &F,
   auto &LI = AM.getResult<llvm::LoopAnalysis>(F);
 
   if (utils::hasBarriers(F, *SAA))
-    formSubCfgs(F, LI, DT, PDT, *SAA, IsSscp_);
+    formSubCfgs(F, LI, DT, PDT, *SAA, IsSscp_, SubgroupSize_);
   else
     createLoopsAroundKernel(F, DT, LI, PDT, IsSscp_);
 
