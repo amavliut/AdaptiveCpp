@@ -421,6 +421,7 @@ class SubCFG {
   llvm::BasicBlock *LoadBB_;
   llvm::BasicBlock *PreHeader_;
   size_t Dim;
+  GroupTier Tier_ = GroupTier::WorkGroup; // WorkGroup: subCFG, SubGroup: subsubCFG
 
   llvm::BasicBlock *
   createExitWithID(llvm::detail::DenseMapPair<llvm::BasicBlock *, size_t> BarrierPair,
@@ -458,6 +459,11 @@ public:
   const BlockVector &getNewBlocks() const noexcept { return NewBlocks_; }
 
   size_t getEntryId() const noexcept { return EntryId_; }
+  const llvm::SmallDenseMap<llvm::BasicBlock *, size_t> &getExitIds() const noexcept {
+    return ExitIds_;
+  }
+  GroupTier getTier() const noexcept { return Tier_; }
+  void setTier(GroupTier Tier) noexcept { Tier_ = Tier; }
 
   llvm::BasicBlock *getEntry() noexcept { return EntryBB_; }
   llvm::BasicBlock *getExit() noexcept { return ExitBB_; }
@@ -554,7 +560,8 @@ SubCFG::SubCFG(llvm::BasicBlock *EntryBarrier, llvm::AllocaInst *LastBarrierIdSt
 }
 
 void SubCFG::print() const {
-  HIPSYCL_DEBUG_INFO << "SubCFG entry barrier: " << EntryId_ << "\n";
+  HIPSYCL_DEBUG_INFO << "SubCFG entry barrier: " << EntryId_ << " ("
+                     << (Tier_ == GroupTier::SubGroup ? "subsubCFG" : "subCFG") << ")\n";
   HIPSYCL_DEBUG_INFO << "SubCFG block names: ";
   HIPSYCL_DEBUG_EXECUTE_INFO(for (auto *BB
                                   : Blocks_) {
@@ -1473,6 +1480,15 @@ struct BarrierAnalysis {
   }
 };
 
+// subsubCFG (SubGroup) if the span's anchor or any of its exits is SG-tier, else subCFG.
+GroupTier classifySpan(const SubCFG &Cfg, const BarrierAnalysis &BA) {
+  bool SG = BA.tier(Cfg.getEntryId()) == GroupTier::SubGroup ||
+            llvm::any_of(Cfg.getExitIds(), [&BA](const auto &Exit) {
+              return BA.tier(Exit.second) == GroupTier::SubGroup;
+            });
+  return SG ? GroupTier::SubGroup : GroupTier::WorkGroup;
+}
+
 void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
                  llvm::PostDominatorTree &PDT, const SplitterAnnotationInfo &SAA, bool IsSscp) {
   HIPSYCL_DEBUG_EXECUTE_VERBOSE(F.viewCFG();)
@@ -1532,8 +1548,10 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
   for (auto &BIt : Barriers) {
     HIPSYCL_DEBUG_INFO << "Create SubCFG from " << BIt.first->getName() << "(" << BIt.first
                        << ") id: " << BIt.second << "\n";
-    if (BIt.second != ExitBarrierId)
+    if (BIt.second != ExitBarrierId) {
       SubCFGs.emplace_back(BIt.first, LastBarrierIdStorage, Barriers, SAA, IndVar, Dim);
+      SubCFGs.back().setTier(classifySpan(SubCFGs.back(), BA)); // no consumer yet 
+    }
   }
 
   llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> InstAllocaMap;
