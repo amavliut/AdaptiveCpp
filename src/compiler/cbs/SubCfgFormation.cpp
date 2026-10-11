@@ -424,44 +424,26 @@ void createLoopsAround(llvm::Function &F, llvm::BasicBlock *AfterBB,
   ContiguousIdx = Idx;
 }
 
-// Small loop for a subsubCFG, same contract as createLoopsAround: one 1-D loop over a
-// sub-group's flattened local ids [sg*S, min(sg*S+S, WG)) (x fastest, as the full loop's
-// contiguous index), inside a loop over sub-groups. The sg loop is per span (temporary),
-// so every sub-group runs the span before the next span starts (same order as the full loop).
+// Lane loop for a subsubCFG, same contract as createLoopsAround: one 1-D loop over the
+// current sub-group's flattened local ids [Begin, End) (x fastest, as the full loop's
+// contiguous index). Begin/End come from the shared loop over sub-groups (sg.header).
 void createSubGroupLoopsAround(llvm::Function &F, llvm::BasicBlock *AfterBB,
-                               llvm::ArrayRef<llvm::Value *> LocalSize, std::size_t SubgroupSize,
-                               int EntryId, llvm::ValueToValueMapTy &VMap,
+                               llvm::ArrayRef<llvm::Value *> LocalSize, llvm::Value *Begin,
+                               llvm::Value *End, int EntryId, llvm::ValueToValueMapTy &VMap,
                                llvm::SmallVector<llvm::BasicBlock *, 3> &Latches,
                                llvm::BasicBlock *&LastHeader, llvm::Value *&ContiguousIdx,
                                bool IsSscp) {
   auto &Ctx = F.getContext();
-  auto *SizeT = F.getParent()->getDataLayout().getLargestLegalIntType(Ctx);
   const std::string Suffix = (".subcfg." + llvm::Twine{EntryId} + "b").str();
   const size_t Dim = LocalSize.size();
   auto *LoadBB = LastHeader;
-  auto *SgHeader = llvm::BasicBlock::Create(Ctx, "sg.header" + Suffix, &F, LoadBB);
   auto *LaneHeader = llvm::BasicBlock::Create(Ctx, "lane.header" + Suffix, &F, LoadBB);
   auto *LaneLatch = llvm::BasicBlock::Create(Ctx, "lane.latch" + Suffix, &F);
-  auto *SgLatch = llvm::BasicBlock::Create(Ctx, "sg.latch" + Suffix, &F);
-  auto *S = llvm::ConstantInt::get(SizeT, SubgroupSize);
-  auto *One = llvm::ConstantInt::get(SizeT, 1);
-
-  // sg header: lane range of this sub-group; the last one may be partial
-  llvm::IRBuilder<> B{SgHeader};
-  auto *Sg = B.CreatePHI(SizeT, 2, "sg" + Suffix);
-  Sg->addIncoming(llvm::ConstantInt::get(SizeT, 0), &F.getEntryBlock());
-  llvm::Value *WG = LocalSize[0];
-  for (size_t D = 1; D < Dim; ++D)
-    WG = B.CreateMul(WG, LocalSize[D], "wg.size" + Suffix);
-  auto *Begin = B.CreateMul(Sg, S, "sg.begin" + Suffix, true);
-  auto *End = B.CreateBinaryIntrinsic(llvm::Intrinsic::umin, B.CreateAdd(Begin, S), WG,
-                                      nullptr, "sg.end" + Suffix);
-  B.CreateBr(LaneHeader);
 
   // lane header: the flattened local id; rebuild per-dimension ids (dimension Dim-1 fastest)
-  B.SetInsertPoint(LaneHeader);
-  auto *Lane = B.CreatePHI(SizeT, 2, "lane" + Suffix);
-  Lane->addIncoming(Begin, SgHeader);
+  llvm::IRBuilder<> B{LaneHeader};
+  auto *Lane = B.CreatePHI(Begin->getType(), 2, "lane" + Suffix);
+  Lane->addIncoming(Begin, &F.getEntryBlock()); // replicate() swaps in the preheader
   llvm::Value *Rest = Lane;
   for (int D = Dim - 1; D >= 0; --D) {
     auto *IdLoad = mergeGVLoadsInEntry(F, LocalIdGlobalNames[IsSscp ? Dim - D - 1 : D]);
@@ -473,22 +455,17 @@ void createSubGroupLoopsAround(llvm::Function &F, llvm::BasicBlock *AfterBB,
 
   // lane latch: next lane of this sub-group (work-item loop, like the full loop)
   B.SetInsertPoint(LaneLatch);
-  auto *NextLane = B.CreateAdd(Lane, One, "lane.next" + Suffix, true);
+  auto *NextLane = B.CreateAdd(Lane, llvm::ConstantInt::get(Lane->getType(), 1),
+                               "lane.next" + Suffix, true);
   Lane->addIncoming(NextLane, LaneLatch);
-  markWorkItemLoop(B.CreateCondBr(B.CreateICmpULT(NextLane, End), LaneHeader, SgLatch));
+  markWorkItemLoop(B.CreateCondBr(B.CreateICmpULT(NextLane, End), LaneHeader, AfterBB));
 
-  // sg latch: next sub-group while it starts inside the work-group
-  B.SetInsertPoint(SgLatch);
-  auto *NextSg = B.CreateAdd(Sg, One, "sg.next" + Suffix, true);
-  Sg->addIncoming(NextSg, SgLatch);
-  B.CreateCondBr(B.CreateICmpULT(B.CreateMul(NextSg, S), WG), SgHeader, AfterBB);
-
-  Latches = {SgLatch, LaneLatch}; // [0] = outermost, as createLoopsAround
-  VMap[AfterBB] = LaneLatch;      // span exits continue with the next lane
+  Latches = {LaneLatch};
+  VMap[AfterBB] = LaneLatch; // span exits continue with the next lane
   zeroUnusedLocalIds(F, Dim);
   VMap[ContiguousIdx] = Lane;
   ContiguousIdx = Lane;
-  LastHeader = SgHeader;
+  LastHeader = LaneHeader;
 }
 
 class SubCFG {
@@ -549,6 +526,10 @@ public:
   }
   GroupTier getTier() const noexcept { return Tier_; }
   void setTier(GroupTier Tier) noexcept { Tier_ = Tier; }
+  // where createExitWithID writes the next id (subsubCFGs: the inner scalar)
+  void setLastBarrierIdStorage(llvm::AllocaInst *Storage) noexcept {
+    LastBarrierIdStorage_ = Storage;
+  }
 
   llvm::BasicBlock *getEntry() noexcept { return EntryBB_; }
   llvm::BasicBlock *getExit() noexcept { return ExitBB_; }
@@ -562,7 +543,7 @@ public:
                      &ContInstReplicaMap,
                  llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
                  llvm::BasicBlock *AfterBB, llvm::ArrayRef<llvm::Value *> LocalSize, bool IsSscp,
-                 std::size_t SubgroupSize);
+                 llvm::Value *SgBegin, llvm::Value *SgEnd);
 
   void arrayifyMultiSubCfgValues(
       llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &InstAllocaMap,
@@ -684,7 +665,7 @@ void SubCFG::replicate(
         &ContInstReplicaMap,
     llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
     llvm::BasicBlock *AfterBB, llvm::ArrayRef<llvm::Value *> LocalSize, bool IsSscp,
-    std::size_t SubgroupSize) {
+    llvm::Value *SgBegin, llvm::Value *SgEnd) {
   llvm::ValueToValueMapTy VMap;
 
   // clone blocks
@@ -708,7 +689,7 @@ void SubCFG::replicate(
   llvm::Value *Idx = ContIdx_;
 
   if (Tier_ == GroupTier::SubGroup) // subsubCFG: small loop over one sub-group's lanes
-    createSubGroupLoopsAround(F, AfterBB, LocalSize, SubgroupSize, EntryId_, VMap, Latches,
+    createSubGroupLoopsAround(F, AfterBB, LocalSize, SgBegin, SgEnd, EntryId_, VMap, Latches,
                               LastHeader, Idx, IsSscp);
   else
     createLoopsAround(F, AfterBB, LocalSize, EntryId_, VMap, Latches, LastHeader, Idx, IsSscp);
@@ -1355,6 +1336,81 @@ llvm::BasicBlock *generateWhileSwitchAround(llvm::BasicBlock *PreHeader, llvm::B
   return WhileHeader;
 }
 
+// While-switch over Spans: Header loads the id from Storage and jumps to that span's entry;
+// each span's exit edge (to AfterBB) goes to Continue. Returns the switch for extra cases.
+llvm::SwitchInst *buildDispatchSwitch(llvm::BasicBlock *Header, llvm::AllocaInst *Storage,
+                                      llvm::ArrayRef<SubCFG *> Spans, llvm::BasicBlock *AfterBB,
+                                      llvm::BasicBlock *Continue) {
+  llvm::IRBuilder<> B{Header};
+  auto *Id = B.CreateLoad(Storage->getAllocatedType(), Storage, Header->getName() + ".id");
+  auto *Switch = B.CreateSwitch(Id, createUnreachableBlock(*Header->getParent()), Spans.size());
+  for (auto *Cfg : Spans) {
+    Switch->addCase(B.getIntN(Id->getType()->getIntegerBitWidth(), Cfg->getEntryId()),
+                    Cfg->getEntry());
+    Cfg->getExit()->getTerminator()->replaceSuccessorWith(AfterBB, Continue);
+  }
+  return Switch;
+}
+
+// Shared loop over sub-groups around the inner dispatch. Each sub-group's turn starts at the
+// WG id in Outer and continues while the inner id is SG-tier (SgIds); after the last sub-group
+// the agreed next WG id is handed back to Outer. InnerHeader is filled by buildDispatchSwitch.
+struct SubGroupPhase {
+  llvm::BasicBlock *Entry, *InnerHeader, *Check;
+  llvm::Value *Begin, *End; // current sub-group's flattened local ids [Begin, End)
+};
+
+SubGroupPhase createSubGroupPhase(llvm::Function &F, llvm::ArrayRef<llvm::Value *> LocalSize,
+                                  std::size_t SubgroupSize, llvm::ArrayRef<size_t> SgIds,
+                                  llvm::AllocaInst *Outer, llvm::AllocaInst *Inner,
+                                  llvm::BasicBlock *OuterHeader) {
+  auto &Ctx = F.getContext();
+  auto *SizeT = Outer->getAllocatedType();
+  auto *Entry = llvm::BasicBlock::Create(Ctx, "sg.phase", &F);
+  auto *Header = llvm::BasicBlock::Create(Ctx, "sg.header", &F);
+  auto *InnerHeader = llvm::BasicBlock::Create(Ctx, "sg.inner", &F);
+  auto *Check = llvm::BasicBlock::Create(Ctx, "sg.check", &F);
+  auto *Latch = llvm::BasicBlock::Create(Ctx, "sg.latch", &F);
+  auto *Handoff = llvm::BasicBlock::Create(Ctx, "sg.handoff", &F);
+  auto *S = llvm::ConstantInt::get(SizeT, SubgroupSize);
+  auto *One = llvm::ConstantInt::get(SizeT, 1);
+
+  llvm::IRBuilder<> B{Entry};
+  B.CreateBr(Header);
+
+  // header: lane range of sub-group sg (the last one may be partial); the turn starts at Outer
+  B.SetInsertPoint(Header);
+  auto *Sg = B.CreatePHI(SizeT, 2, "sg");
+  llvm::Value *WG = LocalSize[0];
+  for (size_t D = 1; D < LocalSize.size(); ++D)
+    WG = B.CreateMul(WG, LocalSize[D], "wg.size");
+  auto *Begin = B.CreateMul(Sg, S, "sg.begin", true);
+  auto *End = B.CreateBinaryIntrinsic(llvm::Intrinsic::umin, B.CreateAdd(Begin, S), WG, nullptr,
+                                      "sg.end");
+  B.CreateStore(B.CreateLoad(SizeT, Outer, "sg.start"), Inner);
+  B.CreateBr(InnerHeader);
+
+  // check: the turn continues while the inner id is a sub-group barrier
+  B.SetInsertPoint(Check);
+  auto *Next = B.CreateSwitch(B.CreateLoad(SizeT, Inner, "sg.check.id"), Latch, SgIds.size());
+  for (auto Id : SgIds)
+    Next->addCase(B.getIntN(SizeT->getIntegerBitWidth(), Id), InnerHeader);
+
+  // latch: next sub-group while it starts inside the work-group
+  B.SetInsertPoint(Latch);
+  auto *NextSg = B.CreateAdd(Sg, One, "sg.next", true);
+  Sg->addIncoming(llvm::ConstantInt::get(SizeT, 0), Entry);
+  Sg->addIncoming(NextSg, Latch);
+  B.CreateCondBr(B.CreateICmpULT(B.CreateMul(NextSg, S), WG), Header, Handoff);
+
+  // handoff: every sub-group stopped at the same WG barrier; continue the outer dispatch there
+  B.SetInsertPoint(Handoff);
+  B.CreateStore(B.CreateLoad(SizeT, Inner, "sg.next.id"), Outer);
+  B.CreateBr(OuterHeader);
+
+  return {Entry, InnerHeader, Check, Begin, End};
+}
+
 // drops all lifetime intrinsics - they are misinforming ASAN otherwise (and are
 // not really fixable at the right scope..)
 void purgeLifetime(SubCFG &Cfg) {
@@ -1658,18 +1714,59 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
   llvm::IRBuilder<> ExitBuilder(NewExit);
   ExitBuilder.CreateRetVoid();
 
+  // subsubCFGs run per sub-group: their exits write the inner id, and their lane loops take
+  // the current sub-group's lanes from one shared loop over sub-groups (built before replicate)
+  llvm::SmallVector<SubCFG *, 8> WgSpans, SgSpans;
+  for (auto &Cfg : SubCFGs)
+    (Cfg.getTier() == GroupTier::SubGroup ? SgSpans : WgSpans).push_back(&Cfg);
+  auto *IdT = llvm::cast<llvm::IntegerType>(LastBarrierIdStorage->getAllocatedType());
+  llvm::BasicBlock *WhileHeader = nullptr;
+  llvm::AllocaInst *InnerIdStorage = nullptr;
+  SubGroupPhase Phase{};
+  if (!SgSpans.empty()) {
+    InnerIdStorage = llvm::IRBuilder<>{F.getEntryBlock().getTerminator()}.CreateAlloca(
+        IdT, nullptr, "InnerBarrierId");
+    for (auto *Cfg : SgSpans)
+      Cfg->setLastBarrierIdStorage(InnerIdStorage);
+    llvm::SmallVector<size_t, 8> SgIds;
+    for (auto &[Id, Tier] : BA.Tiers)
+      if (Tier == GroupTier::SubGroup)
+        SgIds.push_back(Id);
+    WhileHeader = llvm::BasicBlock::Create(F.getContext(), "cbs.while.header", &F);
+    Phase = createSubGroupPhase(F, LocalSize, SubgroupSize, SgIds, LastBarrierIdStorage,
+                                InnerIdStorage, WhileHeader);
+  }
+
   llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> RemappedInstAllocaMap;
   for (auto &Cfg : SubCFGs) {
     Cfg.print();
+    const bool SG = Cfg.getTier() == GroupTier::SubGroup;
     Cfg.replicate(F, InstAllocaMap, BaseInstAllocaMap, InstContReplicaMap, RemappedInstAllocaMap,
-                  NewExit, LocalSize, IsSscp, SubgroupSize);
+                  NewExit, LocalSize, IsSscp, SG ? Phase.Begin : nullptr,
+                  SG ? Phase.End : nullptr);
     purgeLifetime(Cfg);
   }
 
-  llvm::BasicBlock *WhileHeader = nullptr;
-  WhileHeader =
-      generateWhileSwitchAround(&F.getEntryBlock(), F.getEntryBlock().getSingleSuccessor(), NewExit,
-                                LastBarrierIdStorage, SubCFGs);
+  if (SgSpans.empty()) {
+    WhileHeader =
+        generateWhileSwitchAround(&F.getEntryBlock(), F.getEntryBlock().getSingleSuccessor(),
+                                  NewExit, LastBarrierIdStorage, SubCFGs);
+  } else {
+    // inner dispatch: every subsubCFG; a span's exit goes to the turn check
+    buildDispatchSwitch(Phase.InnerHeader, InnerIdStorage, SgSpans, NewExit, Phase.Check);
+    // outer dispatch: subCFGs, WG ids that start a sub-group phase, and the kernel exit
+    auto *Outer =
+        buildDispatchSwitch(WhileHeader, LastBarrierIdStorage, WgSpans, NewExit, WhileHeader);
+    for (auto *Cfg : SgSpans)
+      if (BA.tier(Cfg->getEntryId()) == GroupTier::WorkGroup)
+        Outer->addCase(llvm::ConstantInt::get(IdT, Cfg->getEntryId()), Phase.Entry);
+    Outer->addCase(llvm::ConstantInt::get(IdT, ExitBarrierId), NewExit);
+    // start at the kernel entry barrier
+    auto *EntryTerm = F.getEntryBlock().getTerminator();
+    llvm::IRBuilder<>{EntryTerm}.CreateStore(llvm::ConstantInt::get(IdT, EntryBarrierId),
+                                             LastBarrierIdStorage);
+    EntryTerm->setSuccessor(0, WhileHeader);
+  }
 
   llvm::removeUnreachableBlocks(F);
 
