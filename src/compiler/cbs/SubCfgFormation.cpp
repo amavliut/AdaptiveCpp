@@ -292,15 +292,19 @@ getRegion(llvm::Function &F, const llvm::LoopInfo &LI, llvm::ArrayRef<llvm::Basi
 // calculate uniformity analysis
 hipsycl::compiler::VectorizationInfo
 getVectorizationInfo(llvm::Function &F, hipsycl::compiler::Region &R, llvm::LoopInfo &LI,
-                     llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT, size_t Dim) {
+                     llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT, size_t Dim,
+                     bool IsSscp) {
   hipsycl::compiler::VectorizationInfo VecInfo{F, R};
-  // seed varyingness
-  for (size_t D = 0; D < Dim - 1; ++D) {
+  // seed varyingness: only the innermost work-item loop's dimension (x for SSCP, the last one
+  // otherwise, as in createLoopsAround) steps by 1 with the lane index; the others step once
+  // every size-of-inner lanes. Pinning them cont() too made y - x look uniform (stride 0), 
+  // so e.g. `tidxj <= tidxi` in GROMACS was classified uniform and kept in one shared slot. 
+  // varying() is safer
+  const size_t Inner = IsSscp ? 0 : Dim - 1;
+  for (size_t D = 0; D < Dim; ++D)
     VecInfo.setPinnedShape(*mergeGVLoadsInEntry(F, LocalIdGlobalNames[D]),
-                           hipsycl::compiler::VectorShape::cont());
-  }
-  VecInfo.setPinnedShape(*mergeGVLoadsInEntry(F, LocalIdGlobalNames[Dim - 1]),
-                         hipsycl::compiler::VectorShape::cont());
+                           D == Inner ? hipsycl::compiler::VectorShape::cont()
+                                      : hipsycl::compiler::VectorShape::varying());
 
   hipsycl::compiler::VectorizationAnalysis VecAna{VecInfo, LI, DT, PDT};
   VecAna.analyze();
@@ -1755,7 +1759,7 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
 
   auto RImpl = getRegion(F, LI, Blocks);
   hipsycl::compiler::Region R{*RImpl};
-  auto VecInfo = getVectorizationInfo(F, R, LI, DT, PDT, Dim);
+  auto VecInfo = getVectorizationInfo(F, R, LI, DT, PDT, Dim, IsSscp);
 
   llvm::SmallPtrSet<llvm::BasicBlock *, 2> ExitingBlocks;
   R.getEndingBlocks(ExitingBlocks);
