@@ -169,4 +169,12 @@ private:
 }
 }
 
+// AdaptiveCpp extension: request the sub-group size of the calling kernel, e.g.
+// __acpp_hint_subgroup_size(16) as its first statement. N must be a compile-time constant (a
+// literal or a template argument). On the SSCP host backend it overrides
+// ACPP_OPENMP_SUBGROUP_SIZE for this kernel; other backends ignore it.
+ACPP_KERNEL_TARGET inline void __acpp_hint_subgroup_size(int N) noexcept {
+  __acpp_if_target_sscp(__acpp_sscp_hint_subgroup_size(N););
+}
+
 #endif

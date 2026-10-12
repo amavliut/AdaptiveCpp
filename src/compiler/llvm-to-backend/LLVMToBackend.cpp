@@ -379,6 +379,22 @@ bool LLVMToBackendTranslator::prepareIR(llvm::Module &M) {
 
     enableModuleStateDumping(M, "jit_optimizations", getCompilationIdentifier());
 
+    // __acpp_hint_subgroup_size(N) in the kernels: N for the backend (SubgroupSizeHint, -1 if
+    // not one positive constant); the calls are removed for every backend
+    if (auto *Hint = M.getFunction("__acpp_sscp_hint_subgroup_size")) {
+      for (auto *U : llvm::make_early_inc_range(Hint->users())) {
+        auto *Call = llvm::cast<llvm::CallInst>(U);
+        auto *N = llvm::dyn_cast<llvm::ConstantInt>(Call->getArgOperand(0));
+        const int Size = N ? N->getSExtValue() : -1;
+        SubgroupSizeHint = Size > 0 && (!SubgroupSizeHint || SubgroupSizeHint == Size) ? Size : -1;
+        Call->eraseFromParent();
+      }
+      Hint->eraseFromParent();
+      if (SubgroupSizeHint < 0)
+        HIPSYCL_DEBUG_WARNING << "LLVMToBackend: __acpp_hint_subgroup_size needs one positive "
+                                 "compile-time constant per kernel; ignored\n";
+    }
+
     HIPSYCL_DEBUG_INFO << "LLVMToBackend: Adding backend-specific flavor to IR...\n";
     if(!this->toBackendFlavor(M, PH)) {
       HIPSYCL_DEBUG_INFO << "LLVMToBackend: Flavoring failed\n";

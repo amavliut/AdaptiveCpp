@@ -225,6 +225,7 @@ protected:
 
   // If runtime/user wants a specific subgroup size, this value will be > 0.
   int DesiredSubgroupSize = -1;
+  int SubgroupSizeHint = 0; // from __acpp_hint_subgroup_size(N): N, 0 none, -1 unusable
 
 private:
 

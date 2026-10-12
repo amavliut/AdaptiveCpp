@@ -166,9 +166,9 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
   SLMPass.run(M, *PH.ModuleAnalysisManager);
 
   // Sub-group collectives must still be calls here: linking the builtins inlines their barriers.
-  if (DesiredSubgroupSize > 1) {
+  if (getSubgroupSize() > 1) {
     HoistDivergentSubgroupCollectivesPass HoistPass{
-        DesiredSubgroupSize, {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ}};
+        getSubgroupSize(), {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ}};
     HoistPass.run(M, *PH.ModuleAnalysisManager);
   }
 
@@ -184,7 +184,7 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
   // set subgroup size for llvm ir as a constant
   if (auto *SgSize = M.getGlobalVariable(cbs::HostSubGroupSizeName)) {
     SgSize->setInitializer(llvm::ConstantInt::get(
-        SgSize->getValueType(), DesiredSubgroupSize > 0 ? DesiredSubgroupSize : 1));
+        SgSize->getValueType(), getSubgroupSize()));
     SgSize->setConstant(true);
     SgSize->setLinkage(llvm::GlobalValue::InternalLinkage);
   }
@@ -263,7 +263,7 @@ bool LLVMToHostTranslator::translateToBackendFormat(llvm::Module &FlavoredModule
     PB.registerModuleAnalyses(MAM);
 
     registerCBSPipeline(MPM, hipsycl::compiler::OptLevel::O3, true,
-                        DesiredSubgroupSize > 0 ? DesiredSubgroupSize : 1);
+                        getSubgroupSize());
     HIPSYCL_DEBUG_INFO << "LLVMToHostTranslator: Done registering\n";
 
     llvm::FunctionPassManager FPM;
@@ -613,6 +613,13 @@ AddressSpaceMap LLVMToHostTranslator::getAddressSpaceMap() const {
   ASMap[AddressSpace::ConstantGlobalVariableDefault] = 0;
 
   return ASMap;
+}
+
+// the kernel's __acpp_hint_subgroup_size(N), else ACPP_OPENMP_SUBGROUP_SIZE, else 1
+int LLVMToHostTranslator::getSubgroupSize() const {
+  if (SubgroupSizeHint > 0)
+    return SubgroupSizeHint;
+  return DesiredSubgroupSize > 0 ? DesiredSubgroupSize : 1;
 }
 
 ACPP_BACKEND_API_EXPORT std::unique_ptr<LLVMToBackendTranslator>
