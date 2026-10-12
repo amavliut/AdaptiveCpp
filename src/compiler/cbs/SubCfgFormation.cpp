@@ -551,7 +551,7 @@ public:
       llvm::DenseMap<llvm::Instruction *, llvm::SmallVector<llvm::Instruction *, 8>>
           &ContInstReplicaMap,
       llvm::ArrayRef<SubCFG> SubCFGs, llvm::Instruction *AllocaIP, llvm::Value *ReqdArrayElements,
-      VectorizationInfo &VecInfo);
+      VectorizationInfo &VecInfo, const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &SgBlocks);
   void fixSingleSubCfgValuesDF(
       llvm::DominatorTree &DT,
       const llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
@@ -745,7 +745,7 @@ bool dontArrayifyContiguousValues(
     llvm::DenseMap<llvm::Instruction *, llvm::SmallVector<llvm::Instruction *, 8>>
         &ContInstReplicaMap,
     llvm::Instruction *AllocaIP, llvm::Value *ReqdArrayElements, llvm::Value *IndVar,
-    VectorizationInfo &VecInfo) {
+    VectorizationInfo &VecInfo, const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &SgBlocks) {
   // is cont indvar
   if (VecInfo.isPinned(I))
     return true;
@@ -779,6 +779,10 @@ bool dontArrayifyContiguousValues(
         }
       }
   }
+  // an input defined in a subsubCFG can't live in one shared slot: arrayify I instead
+  if (llvm::any_of(UniformValues,
+                   [&SgBlocks](auto *UI) { return SgBlocks.contains(UI->getParent()); }))
+    return false;
   for (auto *UI : UniformValues) {
     HIPSYCL_DEBUG_INFO << "[SubCFG] UniValue to store: " << *UI << "\n";
     if (BaseInstAllocaMap.lookup(UI))
@@ -800,7 +804,7 @@ void SubCFG::arrayifyMultiSubCfgValues(
     llvm::DenseMap<llvm::Instruction *, llvm::SmallVector<llvm::Instruction *, 8>>
         &ContInstReplicaMap,
     llvm::ArrayRef<SubCFG> SubCFGs, llvm::Instruction *AllocaIP, llvm::Value *ReqdArrayElements,
-    VectorizationInfo &VecInfo) {
+    VectorizationInfo &VecInfo, const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &SgBlocks) {
   llvm::SmallPtrSet<llvm::BasicBlock *, 16> OtherCFGBlocks;
   for (auto &Cfg : SubCFGs) {
     if (&Cfg != this)
@@ -833,9 +837,13 @@ void SubCFG::arrayifyMultiSubCfgValues(
           }
 
         auto Shape = VecInfo.getVectorShape(I);
+        // defined in a subsubCFG: always the full per-lane array, since sub-groups run in turns
+        // and one shared slot could be advanced by one sub-group before another reads it
+        // no single slot for uniform values, and no recompute for contiguous ones
+        const bool SgDefined = SgBlocks.contains(BB);
 #ifndef HIPSYCL_NO_PHIS_IN_SPLIT
         // if value is uniform, just store to 1-wide alloca
-        if (Shape.isUniform()) {
+        if (Shape.isUniform() && !SgDefined) {
           HIPSYCL_DEBUG_INFO << "[SubCFG] Value uniform, store to single element alloca " << I
                              << "\n";
           auto *Alloca = utils::arrayifyInstruction(AllocaIP, &I, ContIdx_, nullptr);
@@ -846,9 +854,9 @@ void SubCFG::arrayifyMultiSubCfgValues(
 #endif
         // if contiguous, and can be recalculated, don't arrayify but store
         // uniform values and insts required for recalculation
-        if (Shape.isContiguousOrStrided()) {
+        if (Shape.isContiguousOrStrided() && !SgDefined) {
           if (dontArrayifyContiguousValues(I, BaseInstAllocaMap, ContInstReplicaMap, AllocaIP,
-                                           ReqdArrayElements, ContIdx_, VecInfo)) {
+                                           ReqdArrayElements, ContIdx_, VecInfo, SgBlocks)) {
             HIPSYCL_DEBUG_INFO << "[SubCFG] Not arrayifying " << I << "\n";
             continue;
           }
@@ -1215,7 +1223,9 @@ void SubCFG::fixSingleSubCfgValues(
             HIPSYCL_DEBUG_INFO << "[SubCFG] No alloca, yet for " << *OPI << "\n";
             Alloca = utils::arrayifyInstruction(
                 AllocaIP, OPI, ContIdx_,
-                VecInfo.getVectorShape(I).isUniform() ? nullptr : ReqdArrayElements);
+                VecInfo.getVectorShape(I).isUniform() && Tier_ == GroupTier::WorkGroup
+                    ? nullptr
+                    : ReqdArrayElements); // subsubCFG: always full width
             VecInfo.setVectorShape(*Alloca, VecInfo.getVectorShape(I));
           }
 
@@ -1706,9 +1716,17 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
   llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> BaseInstAllocaMap;
   llvm::DenseMap<llvm::Instruction *, llvm::SmallVector<llvm::Instruction *, 8>> InstContReplicaMap;
 
+  // original blocks of all subsubCFGs (a block can be in spans of both tiers): values defined
+  // there never get the uniform single-slot or recompute for contiguous values
+  llvm::SmallPtrSet<llvm::BasicBlock *, 16> SgBlocks;
+  for (auto &Cfg : SubCFGs)
+    if (Cfg.getTier() == GroupTier::SubGroup)
+      SgBlocks.insert(Cfg.getBlocks().begin(), Cfg.getBlocks().end());
+
   for (auto &Cfg : SubCFGs)
     Cfg.arrayifyMultiSubCfgValues(InstAllocaMap, BaseInstAllocaMap, InstContReplicaMap, SubCFGs,
-                                  F.getEntryBlock().getTerminator(), ReqdArrayElements, VecInfo);
+                                  F.getEntryBlock().getTerminator(), ReqdArrayElements, VecInfo,
+                                  SgBlocks);
 
   llvm::BasicBlock *NewExit = llvm::BasicBlock::Create(F.getContext(), "cbs.exit", &F);
   llvm::IRBuilder<> ExitBuilder(NewExit);
