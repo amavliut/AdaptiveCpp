@@ -18,6 +18,7 @@
 #include "hipSYCL/compiler/cbs/SplitterAnnotationAnalysis.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceMap.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
+#include "hipSYCL/compiler/llvm-to-backend/host/HoistDivergentSubgroupCollectivesPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/host/HostKernelWrapperPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/host/StaticLocalMemoryPass.hpp"
 #include "hipSYCL/compiler/utils/LLVMUtils.hpp"
@@ -163,6 +164,12 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
   // So we cannot run it in the pipeline at the end of this function.
   HostStaticLocalMemoryPass SLMPass{};
   SLMPass.run(M, *PH.ModuleAnalysisManager);
+
+  // Sub-group collectives must still be calls here: linking the builtins inlines their barriers.
+  if (DesiredSubgroupSize > 1) {
+    HoistDivergentSubgroupCollectivesPass HoistPass{};
+    HoistPass.run(M, *PH.ModuleAnalysisManager);
+  }
 
   std::string BuiltinBitcodeFileName = "libkernel-sscp-host-full.bc";
   if(IsFastMath)
