@@ -113,8 +113,8 @@ bool touchesOnlyPrivateMemory(const llvm::Instruction &I) {
 // every sub-group of one work-group (size known at JIT time). Inputs that don't depend on the lane
 // (kernel arguments, group ids, loads from one address, ...) get the same pseudo-random value in
 // all lanes, so two lanes of a sub-group getting different values prove the value lane-dependent.
-// Whatever can't be evaluated (PHIs, floating point, private memory, calls) gives Unknown: valid
-// code is never reported, some divergent code is missed.
+// Whatever can't be evaluated (PHIs with differing inputs, floating point, private memory, calls)
+// gives Unknown: valid code is never reported, some divergent code is missed.
 class LaneVariance {
 public:
   enum Result { Uniform, Varying, Unknown };
@@ -128,14 +128,18 @@ public:
     const uint64_t W = Size[0] * Size[1] * Size[2];
     if (W == 0 || W > 4096)
       return Unknown;
-    for (Seed = 1; Seed <= 2; ++Seed)
+    Blocked = false;
+    for (Seed = 1; Seed <= 3; ++Seed) // seed 1: group ids 0 (group 0 always exists)
       for (uint64_t First = 0; First < W; First += S) {
         std::optional<llvm::APInt> Ref;
         for (Lane = First; Lane < std::min(First + S, W); ++Lane) {
           Memo.clear();
           auto X = eval(V);
-          if (!X)
+          if (!X) {
+            HIPSYCL_DEBUG_INFO << "[HoistDivergentSubgroupCollectives] can't evaluate " << *V
+                               << ": stops at " << *Blocker << "\n";
             return Unknown;
+          }
           if (!Ref)
             Ref = X;
           else if (*X != *Ref)
@@ -149,6 +153,8 @@ private:
   const llvm::DataLayout &DL;
   std::array<uint64_t, 3> Size;
   uint64_t S, Seed = 0, Lane = 0;
+  const llvm::Value *Blocker = nullptr;
+  bool Blocked = false;
   llvm::DenseMap<const llvm::Value *, std::optional<llvm::APInt>> Memo;
 
   // the same pseudo-random value in every lane, for a lane-independent input
@@ -159,7 +165,10 @@ private:
   std::optional<llvm::APInt> eval(const llvm::Value *V) {
     if (auto It = Memo.find(V); It != Memo.end())
       return It->second;
+    Memo[V] = std::nullopt; // a loop PHI reaching itself: not evaluable
     auto R = compute(V);
+    if (!R && !Blocked) // the first value that can't be evaluated, for the debug output
+      Blocker = V, Blocked = true;
     Memo[V] = R;
     return R;
   }
@@ -193,6 +202,8 @@ private:
         return APInt(W, Lane / S);
       if (N == "__acpp_sscp_get_subgroup_size" || N == "__acpp_sscp_get_subgroup_max_size")
         return APInt(W, S);
+      if (N.starts_with("__acpp_sscp_get_group_id_") && Seed == 1)
+        return APInt(W, 0); // e.g. `if (global_id == 0)` splits a sub-group only in group 0
       if (N.starts_with("__acpp_sscp_get_")) // group ids, group counts: the same in every lane
         return leaf(Fn, W);
       return std::nullopt;
@@ -278,6 +289,16 @@ private:
     }
     if (auto *F = dyn_cast<FreezeInst>(V))
       return eval(F->getOperand(0));
+    if (auto *Phi = dyn_cast<PHINode>(V)) { // the same value on every incoming edge
+      std::optional<APInt> R;
+      for (auto &In : Phi->incoming_values()) {
+        auto X = eval(In);
+        if (!X || (R && *R != *X))
+          return std::nullopt;
+        R = X;
+      }
+      return R;
+    }
     return std::nullopt;
   }
 };
