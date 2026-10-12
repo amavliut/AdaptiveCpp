@@ -13,6 +13,8 @@
 
 #include <llvm/IR/PassManager.h>
 
+#include <array>
+
 namespace hipsycl {
 namespace compiler {
 
@@ -21,11 +23,19 @@ namespace compiler {
 // the sub-group across different sub-group barriers. This pass moves such a call, with its pure
 // input computation, above the branch, so every lane calls it; reductions, scans and votes get
 // the identity element for lanes that didn't take the branch. Runs before the host builtins
-// are linked, while the collectives are still calls.
+// are linked, while the collectives are still calls. A collective that stays under a branch
+// that provably splits a sub-group gets a warning (needs the work-group size known at JIT time).
 class HoistDivergentSubgroupCollectivesPass
     : public llvm::PassInfoMixin<HoistDivergentSubgroupCollectivesPass> {
 public:
+  // GroupSize: x (fastest), y, z, 0 if unknown
+  HoistDivergentSubgroupCollectivesPass(int SubgroupSize, std::array<int, 3> GroupSize)
+      : SubgroupSize{SubgroupSize}, GroupSize{GroupSize} {}
   llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
+
+private:
+  int SubgroupSize;
+  std::array<int, 3> GroupSize;
 };
 
 } // namespace compiler

@@ -13,6 +13,8 @@
 
 #include "hipSYCL/common/debug.hpp"
 
+#include <llvm/ADT/Hashing.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallPtrSet.h>
@@ -21,13 +23,18 @@
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
+#include <llvm/Demangle/Demangle.h>
 
+#include <algorithm>
 #include <functional>
+#include <optional>
 
 namespace hipsycl::compiler {
 namespace {
@@ -102,6 +109,179 @@ bool touchesOnlyPrivateMemory(const llvm::Instruction &I) {
   return Ptr && llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(Ptr));
 }
 
+// Does a value differ between lanes of one sub-group? Decided by evaluating it for every lane of
+// every sub-group of one work-group (size known at JIT time). Inputs that don't depend on the lane
+// (kernel arguments, group ids, loads from one address, ...) get the same pseudo-random value in
+// all lanes, so two lanes of a sub-group getting different values prove the value lane-dependent.
+// Whatever can't be evaluated (PHIs, floating point, private memory, calls) gives Unknown: valid
+// code is never reported, some divergent code is missed.
+class LaneVariance {
+public:
+  enum Result { Uniform, Varying, Unknown };
+
+  LaneVariance(const llvm::DataLayout &DL, std::array<int, 3> GroupSize, int SubgroupSize)
+      : DL{DL}, Size{uint64_t(std::max(GroupSize[0], 0)), uint64_t(std::max(GroupSize[1], 0)),
+                     uint64_t(std::max(GroupSize[2], 0))},
+        S{uint64_t(SubgroupSize)} {}
+
+  Result classify(const llvm::Value *V) {
+    const uint64_t W = Size[0] * Size[1] * Size[2];
+    if (W == 0 || W > 4096)
+      return Unknown;
+    for (Seed = 1; Seed <= 2; ++Seed)
+      for (uint64_t First = 0; First < W; First += S) {
+        std::optional<llvm::APInt> Ref;
+        for (Lane = First; Lane < std::min(First + S, W); ++Lane) {
+          Memo.clear();
+          auto X = eval(V);
+          if (!X)
+            return Unknown;
+          if (!Ref)
+            Ref = X;
+          else if (*X != *Ref)
+            return Varying;
+        }
+      }
+    return Uniform;
+  }
+
+private:
+  const llvm::DataLayout &DL;
+  std::array<uint64_t, 3> Size;
+  uint64_t S, Seed = 0, Lane = 0;
+  llvm::DenseMap<const llvm::Value *, std::optional<llvm::APInt>> Memo;
+
+  // the same pseudo-random value in every lane, for a lane-independent input
+  llvm::APInt leaf(const llvm::Value *V, unsigned W, uint64_t Extra = 0) const {
+    return llvm::APInt(64, size_t(llvm::hash_combine(Seed, V, Extra))).zextOrTrunc(W);
+  }
+
+  std::optional<llvm::APInt> eval(const llvm::Value *V) {
+    if (auto It = Memo.find(V); It != Memo.end())
+      return It->second;
+    auto R = compute(V);
+    Memo[V] = R;
+    return R;
+  }
+
+  std::optional<llvm::APInt> compute(const llvm::Value *V) {
+    using namespace llvm;
+    Type *T = V->getType();
+    if (!T->isIntegerTy() && !T->isPointerTy())
+      return std::nullopt;
+    const unsigned W = DL.getTypeSizeInBits(T);
+    if (W > 64)
+      return std::nullopt;
+    if (auto *CI = dyn_cast<ConstantInt>(V))
+      return CI->getValue();
+    if (isa<Constant>(V) || isa<Argument>(V))
+      return leaf(V, W);
+
+    if (auto *Call = dyn_cast<CallInst>(V)) {
+      auto *Fn = Call->getCalledFunction();
+      if (!Fn)
+        return std::nullopt;
+      StringRef N = Fn->getName();
+      const uint64_t Id[3] = {Lane % Size[0], Lane / Size[0] % Size[1], Lane / (Size[0] * Size[1])};
+      if (N.consume_front("__acpp_sscp_get_local_id_"))
+        return APInt(W, Id[N[0] - 'x']);
+      if (N.consume_front("__acpp_sscp_get_local_size_"))
+        return APInt(W, Size[N[0] - 'x']);
+      if (N == "__acpp_sscp_get_subgroup_local_id")
+        return APInt(W, Lane % S);
+      if (N == "__acpp_sscp_get_subgroup_id")
+        return APInt(W, Lane / S);
+      if (N == "__acpp_sscp_get_subgroup_size" || N == "__acpp_sscp_get_subgroup_max_size")
+        return APInt(W, S);
+      if (N.starts_with("__acpp_sscp_get_")) // group ids, group counts: the same in every lane
+        return leaf(Fn, W);
+      return std::nullopt;
+    }
+    if (auto *L = dyn_cast<LoadInst>(V)) {
+      if (isa<AllocaInst>(getUnderlyingObject(L->getPointerOperand())))
+        return std::nullopt; // private memory: content per lane unknown
+      auto A = eval(L->getPointerOperand());
+      if (!A)
+        return std::nullopt;
+      return leaf(L, W, A->getZExtValue()); // the same address gives the same value
+    }
+    if (auto *G = dyn_cast<GEPOperator>(V)) {
+      auto P = eval(G->getPointerOperand());
+      SmallMapVector<Value *, APInt, 4> VarOffsets;
+      APInt Offset(W, 0);
+      if (!P || !G->collectOffset(DL, W, VarOffsets, Offset))
+        return std::nullopt;
+      APInt R = *P + Offset;
+      for (auto &[Idx, Scale] : VarOffsets) {
+        auto X = eval(Idx);
+        if (!X)
+          return std::nullopt;
+        R += X->sextOrTrunc(W) * Scale;
+      }
+      return R;
+    }
+    if (auto *C = dyn_cast<CastInst>(V)) {
+      auto X = eval(C->getOperand(0));
+      if (!X)
+        return std::nullopt;
+      switch (C->getOpcode()) {
+      case Instruction::SExt:
+        return X->sext(W);
+      case Instruction::Trunc: case Instruction::ZExt: case Instruction::PtrToInt:
+      case Instruction::IntToPtr: case Instruction::BitCast: case Instruction::AddrSpaceCast:
+        return X->zextOrTrunc(W);
+      default:
+        return std::nullopt;
+      }
+    }
+    if (auto *B = dyn_cast<BinaryOperator>(V)) {
+      auto X = eval(B->getOperand(0)), Y = eval(B->getOperand(1));
+      if (!X || !Y)
+        return std::nullopt;
+      switch (B->getOpcode()) {
+      case Instruction::Add: return *X + *Y;
+      case Instruction::Sub: return *X - *Y;
+      case Instruction::Mul: return *X * *Y;
+      case Instruction::And: return *X & *Y;
+      case Instruction::Or:  return *X | *Y;
+      case Instruction::Xor: return *X ^ *Y;
+      case Instruction::Shl: case Instruction::LShr: case Instruction::AShr: {
+        if (Y->uge(W))
+          return std::nullopt;
+        const unsigned Sh = Y->getZExtValue();
+        return B->getOpcode() == Instruction::Shl    ? X->shl(Sh)
+               : B->getOpcode() == Instruction::LShr ? X->lshr(Sh)
+                                                     : X->ashr(Sh);
+      }
+      case Instruction::UDiv: case Instruction::URem: case Instruction::SDiv: case Instruction::SRem:
+        if (Y->isZero())
+          return std::nullopt;
+        return B->getOpcode() == Instruction::UDiv   ? X->udiv(*Y)
+               : B->getOpcode() == Instruction::URem ? X->urem(*Y)
+               : B->getOpcode() == Instruction::SDiv ? X->sdiv(*Y)
+                                                     : X->srem(*Y);
+      default:
+        return std::nullopt;
+      }
+    }
+    if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+      auto X = eval(Cmp->getOperand(0)), Y = eval(Cmp->getOperand(1));
+      if (!X || !Y)
+        return std::nullopt;
+      return APInt(1, ICmpInst::compare(*X, *Y, Cmp->getPredicate()));
+    }
+    if (auto *Sel = dyn_cast<SelectInst>(V)) {
+      auto C = eval(Sel->getCondition());
+      if (!C)
+        return std::nullopt;
+      return eval(C->isOne() ? Sel->getTrueValue() : Sel->getFalseValue());
+    }
+    if (auto *F = dyn_cast<FreezeInst>(V))
+      return eval(F->getOperand(0));
+    return std::nullopt;
+  }
+};
+
 class Hoister {
   llvm::DominatorTree DT;
   llvm::PostDominatorTree PDT;
@@ -112,17 +292,21 @@ class Hoister {
     return false;
   }
 
+  // the block whose branch decides whether B runs: nearest dominator B doesn't post-dominate
+  llvm::BasicBlock *controllingBlock(llvm::BasicBlock *B) const {
+    for (auto *N = DT.getNode(B)->getIDom(); N; N = N->getIDom())
+      if (!PDT.dominates(B, N->getBlock()))
+        return N->getBlock();
+    return nullptr;
+  }
+
 public:
   explicit Hoister(llvm::Function &F) : DT{F}, PDT{F}, LI{DT} {}
 
   // moves C above its nearest controlling branch; false if C has none or can't be moved
   bool hoistOnce(llvm::CallInst &C) {
     auto *B = C.getParent();
-    // the controlling branch: nearest dominator that B doesn't post-dominate
-    llvm::BasicBlock *G = nullptr;
-    for (auto *N = DT.getNode(B)->getIDom(); N && !G; N = N->getIDom())
-      if (!PDT.dominates(B, N->getBlock()))
-        G = N->getBlock();
+    llvm::BasicBlock *G = controllingBlock(B);
     if (!G)
       return false; // every lane that runs the function reaches C
     auto *Br = llvm::dyn_cast<llvm::BranchInst>(G->getTerminator());
@@ -196,6 +380,38 @@ public:
                        << G->getName() << "\n";
     return true;
   }
+
+  // C (wherever hoisting left it) still runs under a branch that splits a sub-group: warn
+  void warnIfDivergent(llvm::CallInst &C, LaneVariance &LV) const {
+    for (auto *G = controllingBlock(C.getParent()); G; G = controllingBlock(G)) {
+      const llvm::Value *Cond = nullptr;
+      if (auto *Br = llvm::dyn_cast<llvm::BranchInst>(G->getTerminator()); Br && Br->isConditional())
+        Cond = Br->getCondition();
+      else if (auto *Sw = llvm::dyn_cast<llvm::SwitchInst>(G->getTerminator()))
+        Cond = Sw->getCondition();
+      if (!Cond || LV.classify(Cond) != LaneVariance::Varying)
+        continue;
+      std::string Kernel = llvm::demangle(C.getFunction()->getName().str());
+      if (Kernel.size() > 160)
+        Kernel = Kernel.substr(0, 157) + "...";
+      // source location (with -g): the innermost inlined frame outside AdaptiveCpp's headers
+      std::string Where;
+      for (const llvm::DILocation *L = C.getDebugLoc().get(); L; L = L->getInlinedAt()) {
+        llvm::StringRef File = L->getFilename();
+        if (!File.contains("/hipSYCL/") && !File.contains("/include/AdaptiveCpp/")) {
+          Where = " at " + File.str() + ":" + std::to_string(L->getLine());
+          break;
+        }
+      }
+      HIPSYCL_DEBUG_WARNING
+          << "Sub-group collective "
+          << C.getCalledFunction()->getName().drop_front(CollectivePrefix.size()) << Where
+          << " is reached by only part of a sub-group (lane-dependent branch) in " << Kernel
+          << ". This is undefined in SYCL and gives wrong results on this backend; call it from"
+             " every lane of the sub-group (e.g. move it out of the branch).\n";
+      return;
+    }
+  }
 };
 
 } // namespace
@@ -220,6 +436,9 @@ llvm::PreservedAnalyses HoistDivergentSubgroupCollectivesPass::run(llvm::Module 
     for (auto *C : Calls)
       while (H.hoistOnce(*C))
         Changed = true;
+    LaneVariance LV{M.getDataLayout(), GroupSize, SubgroupSize};
+    for (auto *C : Calls)
+      H.warnIfDivergent(*C, LV);
   }
   return Changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
 }

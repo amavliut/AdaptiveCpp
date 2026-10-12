@@ -167,7 +167,8 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
 
   // Sub-group collectives must still be calls here: linking the builtins inlines their barriers.
   if (DesiredSubgroupSize > 1) {
-    HoistDivergentSubgroupCollectivesPass HoistPass{};
+    HoistDivergentSubgroupCollectivesPass HoistPass{
+        DesiredSubgroupSize, {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ}};
     HoistPass.run(M, *PH.ModuleAnalysisManager);
   }
 
