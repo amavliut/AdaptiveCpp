@@ -19,6 +19,7 @@
 #include "hipSYCL/common/debug.hpp"
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -43,6 +44,7 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Transforms/Utils/LoopSimplify.h>
+#include <llvm/Transforms/Utils/SSAUpdater.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -560,6 +562,10 @@ public:
       llvm::DominatorTree &DT,
       const llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
       llvm::Value *ReqdArrayElements, VectorizationInfo &VecInfo);
+  void fixSingleSubCfgValuesNew(
+      llvm::DominatorTree &DT,
+      const llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
+      llvm::Value *ReqdArrayElements, VectorizationInfo &VecInfo);
   void fixValueByDominanceFrontierPHIs(
       llvm::Instruction &I, llvm::Instruction *OPI,
       const llvm::SmallPtrSetImpl<llvm::BasicBlock *> &DefiningBlocks,
@@ -1038,6 +1044,7 @@ llvm::BasicBlock *SubCFG::createLoadBB(llvm::ValueToValueMapTy &VMap) {
 }
 
 namespace {
+// legacy, now rewritten in fixSingleSubCfgValuesNew using SSAUpdater
 bool isPhiDominated(llvm::Instruction &I, llvm::Instruction *OPI, llvm::DominatorTree &DT) {
   if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(&I)) {
     // if a PHI node, we have to check that the incoming values dominate the terminators
@@ -1058,6 +1065,7 @@ bool isPhiDominated(llvm::Instruction &I, llvm::Instruction *OPI, llvm::Dominato
   return false;
 }
 
+// legacy, now rewritten in fixSingleSubCfgValuesNew using SSAUpdater
 llvm::Instruction *findLeastDominatingLoad(llvm::BasicBlock *CurrentBB, llvm::Instruction *OPI,
                                            llvm::SmallVectorImpl<llvm::Instruction *> &Loads,
                                            llvm::BasicBlock *LoadBB, llvm::DominatorTree &DT) {
@@ -1081,6 +1089,7 @@ llvm::Instruction *findLeastDominatingLoad(llvm::BasicBlock *CurrentBB, llvm::In
   return nullptr;
 }
 
+// legacy, now rewritten in fixSingleSubCfgValuesNew using SSAUpdater
 llvm::Instruction *findLeastDominatingLoad(llvm::Instruction &I, llvm::Instruction *OPI,
                                            llvm::SmallVectorImpl<llvm::Instruction *> &Loads,
                                            llvm::BasicBlock *LoadBB, llvm::DominatorTree &DT) {
@@ -1089,6 +1098,7 @@ llvm::Instruction *findLeastDominatingLoad(llvm::Instruction &I, llvm::Instructi
 }
 } // namespace
 
+// legacy, now rewritten in fixSingleSubCfgValuesNew using SSAUpdater
 // Makes the value \a OPI available at the use in \a I by inserting PHI nodes at the
 // iterated dominance frontier of \a DefiningBlocks, then rewrites the use in \a I to the
 // least-dominating definition.
@@ -1165,6 +1175,7 @@ void SubCFG::fixValueByDominanceFrontierPHIs(
   }
 }
 
+// legacy, now rewritten in fixSingleSubCfgValuesNew using SSAUpdater
 // if the kernel contained a loop, it is possible, that values inside a single
 // subcfg don't dominate their uses inside the same subcfg. This function
 // identifies and fixes those values.
@@ -1305,6 +1316,74 @@ void SubCFG::fixSingleSubCfgValues(
         }
       }
     }
+  }
+}
+
+// if the kernel contained a loop, it is possible, that values inside a single
+// subcfg don't dominate their uses inside the same subcfg. This function
+// identifies and fixes those values, placing the PHIs with LLVM's SSAUpdater.
+void SubCFG::fixSingleSubCfgValuesNew(
+    llvm::DominatorTree &DT,
+    const llvm::DenseMap<llvm::Instruction *, llvm::AllocaInst *> &RemappedInstAllocaMap,
+    llvm::Value *ReqdArrayElements, VectorizationInfo &VecInfo) {
+
+  auto *AllocaIP = LoadBB_->getParent()->getEntryBlock().getTerminator();
+  auto *LoadIP = LoadBB_->getTerminator();
+  auto *UniLoadIP = PreHeader_->getTerminator();
+  llvm::IRBuilder Builder{LoadIP};
+
+  // find undominated uses
+  llvm::MapVector<llvm::Instruction *, llvm::SmallVector<llvm::Use *, 4>> UndominatedUses;
+  for (auto *BB : NewBlocks_)
+    for (auto &I : *BB)
+      for (auto &U : I.operands())
+        if (auto *OPI = llvm::dyn_cast<llvm::Instruction>(U.get()); OPI && !DT.dominates(OPI, U))
+          UndominatedUses[OPI].push_back(&U);
+
+  for (auto &[OPI, Uses] : UndominatedUses) {
+    HIPSYCL_DEBUG_INFO << "[SubCFG] Value does not dominate all its uses: " << *OPI << "\n";
+    
+    // pointer into a per-lane array, recompute it once and point every use at the new copy
+    if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(OPI))
+      if (auto *MDArrayified = GEP->getMetadata(hipsycl::compiler::MDKind::Arrayified)) {
+        auto *NewGEP = llvm::cast<llvm::GetElementPtrInst>(Builder.CreateInBoundsGEP(
+            GEP->getType(), GEP->getPointerOperand(), ContIdx_, GEP->getName() + "c"));
+        NewGEP->setMetadata(hipsycl::compiler::MDKind::Arrayified, MDArrayified);
+        for (auto *U : Uses)
+          U->set(NewGEP);
+        continue;
+      }
+
+    // arraify unless OPI it is already arraifyed or the value is used only inside this one span only
+    // reuse OPI's storage if it has one, else create it: one slot if uniform in a subCFG, else a per-lane array
+    llvm::AllocaInst *Alloca = RemappedInstAllocaMap.lookup(OPI);
+    // only a fallback: a load from ordinary memory must not drop the found storage (Alloca)
+    if (auto *LInst = llvm::dyn_cast<llvm::LoadInst>(OPI); LInst && !Alloca)
+      Alloca = utils::getLoopStateAllocaForLoad(*LInst);
+    if (!Alloca) {
+      HIPSYCL_DEBUG_INFO << "[SubCFG] No alloca, yet for " << *OPI << "\n";
+      Alloca = utils::arrayifyInstruction(
+          AllocaIP, OPI, ContIdx_,
+          VecInfo.getVectorShape(*OPI).isUniform() && Tier_ == GroupTier::WorkGroup
+              ? nullptr
+              : ReqdArrayElements); // subsubCFG: always full width
+      VecInfo.setVectorShape(*Alloca, VecInfo.getVectorShape(*OPI));
+    }
+
+    // the value on entering the subcfg; a single-slot (uniform) one is loaded before the wi-loop
+    auto *IP = Alloca->isArrayAllocation() ? LoadIP : UniLoadIP;
+    auto *Load = utils::loadFromAlloca(Alloca, ContIdx_, IP, OPI->getName());
+    utils::copyDgbValues(OPI, Load, IP);
+
+    // when two definitions of one value, f.e. load at span entry and OPI in its own block (the header)
+    // if both reach a use (the latch of a loop entered mid-body) SSAUpdater inserts a PHI
+    llvm::SSAUpdater SSA;
+    SSA.Initialize(OPI->getType(), OPI->getName());
+    SSA.AddAvailableValue(LoadBB_, Load);
+    SSA.AddAvailableValue(OPI->getParent(), OPI);
+    // the latch fix for double definition
+    for (auto *U : Uses)
+      SSA.RewriteUse(*U);
   }
 }
 
@@ -1793,7 +1872,7 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
   arrayifyAllocas(&F.getEntryBlock(), DT, SubCFGs, ReqdArrayElements, VecInfo);
 
   for (auto &Cfg : SubCFGs) {
-    Cfg.fixSingleSubCfgValues(DT, RemappedInstAllocaMap, ReqdArrayElements, VecInfo);
+    Cfg.fixSingleSubCfgValuesNew(DT, RemappedInstAllocaMap, ReqdArrayElements, VecInfo);
   }
 
   IndVar->eraseFromParent();
