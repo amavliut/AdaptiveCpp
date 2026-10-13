@@ -1557,7 +1557,8 @@ bool fillUserHull(llvm::AllocaInst *Alloca, llvm::SmallVectorImpl<llvm::Instruct
               continue;
             }
           }
-          if (UI->mayReadOrWriteMemory() || UI->getType()->isPointerTy())
+          // also through vectors of pointers (e.g. per-lane pointers in vectorized code)
+          if (UI->mayReadOrWriteMemory() || UI->getType()->isPtrOrPtrVectorTy())
             WL.push_back(UI);
           if (auto CI = llvm::dyn_cast<llvm::CallBase>(UI)) {
             auto OperandNo = U.getOperandNo();
