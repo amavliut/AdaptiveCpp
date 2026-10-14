@@ -19,6 +19,7 @@
 #include "hipSYCL/compiler/cbs/PHIsToAllocas.hpp"
 #include "hipSYCL/compiler/cbs/RemoveBarrierCalls.hpp"
 #include "hipSYCL/compiler/cbs/SimplifyKernel.hpp"
+#include "hipSYCL/compiler/cbs/SubgroupSteps.hpp"
 #include "hipSYCL/compiler/cbs/SplitterAnnotationAnalysis.hpp"
 #include "hipSYCL/compiler/cbs/SubCfgFormation.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/host/HostKernelWrapperPass.hpp"
@@ -90,6 +91,8 @@ void registerCBSPipeline(llvm::ModulePassManager &MPM, OptLevel Opt, bool IsSscp
 #endif
   FPM.addPass(llvm::LoopSimplifyPass{});
 
+  if (IsSscp && SubgroupSize > 1) // collectives kept by LLVMToHost: one step per sub-group
+    FPM.addPass(SubgroupStepsPass{SubgroupSize});
   FPM.addPass(CanonicalizeBarriersPass{});
   if (IsSscp)
     FPM.addPass(KernelFlatteningPass{});

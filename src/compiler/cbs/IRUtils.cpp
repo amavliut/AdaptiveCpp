@@ -503,8 +503,11 @@ llvm::AllocaInst *getLoopStateAllocaForLoad(llvm::LoadInst &LInst) {
   } else {
     Alloca = llvm::dyn_cast<llvm::AllocaInst>(LInst.getPointerOperand());
   }
-  if (Alloca && Alloca->hasMetadata(hipsycl::compiler::MDKind::Arrayified))
-    return Alloca;
+  // a loaded value can live on in its array only if the array is indexed by work-item
+  if (auto *MD = Alloca ? Alloca->getMetadata(hipsycl::compiler::MDKind::Arrayified) : nullptr)
+    if (auto *Kind = llvm::dyn_cast<llvm::MDString>(MD->getOperand(0));
+        Kind && Kind->getString() == hipsycl::compiler::MDKind::LoopState)
+      return Alloca;
   return nullptr;
 }
 
