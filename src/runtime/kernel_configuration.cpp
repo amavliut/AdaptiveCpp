@@ -28,7 +28,8 @@ public:
       {"amdgpu-target-device", kernel_build_option::amdgpu_target_device},
       {"spirv-dynamic-local-mem-allocation-size", kernel_build_option::spirv_dynamic_local_mem_allocation_size},
       {"host-vector-math-library", kernel_build_option::host_vector_math_library},
-      {"metal-max-args-for-flat-mode", kernel_build_option::metal_max_args_for_flat_mode}
+      {"metal-max-args-for-flat-mode", kernel_build_option::metal_max_args_for_flat_mode},
+      {"openmp-vectorize", kernel_build_option::openmp_vectorize}
     };
 
     _flags = {

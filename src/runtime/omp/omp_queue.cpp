@@ -570,6 +570,9 @@ result omp_queue::submit_sscp_kernel_from_code_object(
   // Kernels with different subgroup sizes will have different cache keys
   _config.set_build_option(kernel_build_option::desired_subgroup_size,
                            get_omp_subgroup_size());
+  // ACPP_OPENMP_VECTORIZE=1: vectorize kernels at sub-group width (llvm-to-host built WITH_RV)
+  if (application::get_settings().get<setting::openmp_vectorize>())
+    _config.set_build_option(kernel_build_option::openmp_vectorize, 1);
 
   auto binary_configuration_id =
       adaptivity_engine.finalize_binary_configuration(_config);

@@ -46,6 +46,7 @@ protected:
 private:
   int getSubgroupSize() const;
   std::vector<std::string> KernelNames;
+  bool Vectorize = false; // openmp-vectorize: SubgroupVectorizerPass (WITH_RV builds)
   host_vector_math_library VectorMathLibary = host_vector_math_library::DEFAULT_VEC_MATH_LIB;
 };
 

@@ -67,6 +67,9 @@ static constexpr const char SscpDynamicLocalMemoryPtrName[] = "__acpp_cbs_sscp_d
 static constexpr const char SscpInternalLocalMemoryPtrName[] = "__acpp_cbs_sscp_internal_local_memory";
 
 static constexpr const char CbsKernelDimensionName[] = "acpp_cbs_kernel_dimension";
+// on a kernel vectorized at sub-group width (host SubgroupVectorizerPass): its number of
+// sub-groups; CBS then runs it as a 1D kernel with one work-item per sub-group
+static constexpr const char SubgroupInstancesAttrName[] = "acpp-subgroup-instances";
 } // namespace cbs
 
 static constexpr const char SscpAnnotationsName[] = "hipsycl.sscp.annotations";

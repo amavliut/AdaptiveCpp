@@ -58,7 +58,9 @@ enum class kernel_build_option : int {
 
   host_vector_math_library,
 
-  metal_max_args_for_flat_mode
+  metal_max_args_for_flat_mode,
+
+  openmp_vectorize
 };
 
 enum class kernel_build_flag : int {

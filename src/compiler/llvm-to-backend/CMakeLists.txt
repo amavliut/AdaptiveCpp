@@ -314,6 +314,16 @@ if(WITH_SSCP_COMPILER)
       -DACPP_LLC_ADDITIONAL_FLAGS="${HOST_ADDITIONAL_LLC_FLAGS}"
       -DACPP_OPT_ADDITIONAL_FLAGS="${HOST_ADDITIONAL_OPT_FLAGS}")
     target_link_libraries(llvm-to-host PRIVATE acpp-clang-cbs)
+
+    # Experimental: vectorize kernels at sub-group width with RV (ACPP_OPENMP_VECTORIZE=1).
+    # RV_DIR: RV source tree (release/20.x), built position-independent in RV_DIR/build.
+    if(WITH_RV)
+      target_sources(llvm-to-host PRIVATE host/SubgroupVectorizerPass.cpp)
+      set_source_files_properties(host/SubgroupVectorizerPass.cpp PROPERTIES COMPILE_OPTIONS -fno-rtti)
+      target_include_directories(llvm-to-host PRIVATE ${RV_DIR}/include)
+      target_link_libraries(llvm-to-host PRIVATE ${RV_DIR}/build/src/libRV.a)
+      target_compile_definitions(llvm-to-host PRIVATE ACPP_WITH_RV)
+    endif()
   endif()
 
   if(WITH_LLVM_TO_METAL)

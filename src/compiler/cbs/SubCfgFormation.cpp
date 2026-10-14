@@ -36,6 +36,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Value.h>
@@ -113,6 +114,8 @@ llvm::LoadInst *mergeGVLoadsInEntry(llvm::Function &F, llvm::StringRef VarName) 
 
 // parses the range dimensionality from the mangled kernel name
 std::size_t getRangeDim(llvm::Function &F, bool IsSscp) {
+  if (F.hasFnAttribute(SubgroupInstancesAttrName))
+    return 1;
   auto FName = F.getName();
   // todo: fix with MS mangling
   llvm::Regex Rgx("iterate_nd_range_ompILi([1-3])E");
@@ -259,6 +262,11 @@ void loadSizeValuesFromArgument(llvm::Function &F, int Dim, llvm::Value *LocalSi
 llvm::SmallVector<llvm::Value *, 3> getLocalSizeValues(llvm::Function &F, int Dim,
                                                        bool isSscpKernel) {
   if (isSscpKernel) {
+    if (auto A = F.getFnAttribute(SubgroupInstancesAttrName); A.isValid()) {
+      uint64_t N = 0;
+      A.getValueAsString().getAsInteger(10, N);
+      return {llvm::ConstantInt::get(getLoadForGlobalVariable(F, LocalSizeGlobalNames[0])->getType(), N)};
+    }
     llvm::SmallVector<llvm::Value *, 3> LocalSize(Dim);
     for (int I = 0; I < Dim; ++I) {
       auto Load = getLoadForGlobalVariable(F, LocalSizeGlobalNames[Dim - I - 1]);
@@ -309,6 +317,12 @@ getVectorizationInfo(llvm::Function &F, hipsycl::compiler::Region &R, llvm::Loop
 
   hipsycl::compiler::VectorizationAnalysis VecAna{VecInfo, LI, DT, PDT};
   VecAna.analyze();
+  // a kernel vectorized at sub-group width (its work-items are sub-groups): its vector code
+  // (per-lane allocas, gathers through vectors of pointers) is beyond this analysis, so every
+  // value is kept per work-item, cheap with only work-group size / S of them
+  if (F.hasFnAttribute(SubgroupInstancesAttrName))
+    for (auto &I : llvm::instructions(F))
+      VecInfo.setVectorShape(I, hipsycl::compiler::VectorShape::varying());
   return VecInfo;
 }
 

@@ -81,7 +81,8 @@ enum class setting {
   jitopt_iads_relative_threshold_min_data,
   enable_allocation_tracking,
   jitopt_host_vector_math_library,
-  openmp_subgroup_size
+  openmp_subgroup_size,
+  openmp_vectorize
 };
 
 template <setting S> struct setting_trait {};
@@ -124,6 +125,7 @@ HIPSYCL_RT_MAKE_SETTING_TRAIT(setting::jitopt_host_vector_math_library,
                               "jitopt_host_vector_math_library",
                               std::optional<jitopt_host_vector_math_library>)
 HIPSYCL_RT_MAKE_SETTING_TRAIT(setting::openmp_subgroup_size, "openmp_subgroup_size", std::size_t)
+HIPSYCL_RT_MAKE_SETTING_TRAIT(setting::openmp_vectorize, "openmp_vectorize", std::size_t)
 
 class settings
 {
@@ -172,6 +174,8 @@ public:
       return _jitopt_host_vector_math_library;
     } else if constexpr(S == setting::openmp_subgroup_size) {
       return _openmp_subgroup_size;
+    } else if constexpr(S == setting::openmp_vectorize) {
+      return _openmp_vectorize;
     }
     return typename setting_trait<S>::type{};
   }
@@ -230,6 +234,7 @@ public:
             std::optional<jitopt_host_vector_math_library>{});
     _openmp_subgroup_size =
         get_configuration_or_default<setting::openmp_subgroup_size>(std::size_t{1});
+    _openmp_vectorize = get_configuration_or_default<setting::openmp_vectorize>(std::size_t{0});
   }
 
 private:
@@ -263,6 +268,7 @@ private:
   bool _enable_allocation_tracking;
   std::optional<jitopt_host_vector_math_library> _jitopt_host_vector_math_library;
   std::size_t _openmp_subgroup_size;
+  std::size_t _openmp_vectorize;
 };
 
 }

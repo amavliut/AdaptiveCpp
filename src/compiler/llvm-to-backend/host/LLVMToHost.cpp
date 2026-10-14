@@ -20,6 +20,9 @@
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceMap.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/host/HoistDivergentSubgroupCollectivesPass.hpp"
+#ifdef ACPP_WITH_RV
+#include "hipSYCL/compiler/llvm-to-backend/host/SubgroupVectorizerPass.hpp"
+#endif
 #include "hipSYCL/compiler/llvm-to-backend/host/HostKernelWrapperPass.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/host/StaticLocalMemoryPass.hpp"
 #include "hipSYCL/compiler/utils/LLVMUtils.hpp"
@@ -167,6 +170,11 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
   SLMPass.run(M, *PH.ModuleAnalysisManager);
 
   // Sub-group collectives must still be calls here: linking the builtins inlines their barriers.
+#ifdef ACPP_WITH_RV
+  if (Vectorize && getSubgroupSize() > 1)
+    SubgroupVectorizerPass{getSubgroupSize(), {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ},
+                           KernelNames}.run(M, *PH.ModuleAnalysisManager);
+#endif
   if (getSubgroupSize() > 1) {
     HoistDivergentSubgroupCollectivesPass HoistPass{
         getSubgroupSize(), {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ}};
@@ -593,6 +601,10 @@ bool LLVMToHostTranslator::translateToBackendFormat(llvm::Module &FlavoredModule
 bool LLVMToHostTranslator::applyBuildOption(const std::string &Option, const std::string &Value) {
   if (Option == "host-vector-math-library") {
     VectorMathLibary = static_cast<host_vector_math_library>(std::stoi(Value));
+    return true;
+  }
+  if (Option == "openmp-vectorize") {
+    Vectorize = std::stoi(Value) != 0;
     return true;
   }
   return false;

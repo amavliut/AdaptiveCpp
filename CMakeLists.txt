@@ -238,6 +238,8 @@ set(WITH_CUDA_BACKEND ${CUDA_FOUND} CACHE BOOL "Build AdaptiveCpp support for NV
 set(WITH_ROCM_BACKEND ${ROCM_FOUND} CACHE BOOL "Build AdaptiveCpp support for AMD GPUs with ROCm")
 set(WITH_OPENCL_BACKEND ${OpenCL_FOUND} CACHE BOOL "Build AdaptiveCpp support for OpenCL SPIR-V devices supporting USM")
 set(WITH_VULKAN_BACKEND OFF CACHE BOOL "Build AdaptiveCpp support for Vulkan") # Default to OFF while experimental
+set(WITH_RV OFF CACHE BOOL "Experimental: vectorize OpenMP-backend kernels at sub-group width with RV (ACPP_OPENMP_VECTORIZE=1)")
+set(RV_DIR "" CACHE PATH "RV (github.com/cdl-saarland/rv, release/20.x) source tree, built position-independent in RV_DIR/build")
 
 set(WITH_CPU_BACKEND true)
 
