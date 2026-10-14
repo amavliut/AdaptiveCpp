@@ -25,8 +25,9 @@ namespace compiler {
 // Sub-group collectives become vector operations (masked: inactive lanes contribute the
 // identity), sub-group barriers vanish. The kernel body becomes one call of the vectorized code
 // per sub-group, and CBS runs the kernel as a 1D kernel over its sub-groups. Runs before the
-// host builtins are linked, while ids and collectives are still calls. A kernel stays scalar if
-// the work-group size is unknown or not a multiple of S, or it uses an unsupported builtin.
+// host builtins are linked, while ids and collectives are still calls. If S doesn't divide the
+// work-group size, the last sub-group's missing lanes are masked off. A kernel stays scalar if
+// the work-group size is unknown or it uses an unsupported builtin.
 class SubgroupVectorizerPass : public llvm::PassInfoMixin<SubgroupVectorizerPass> {
 public:
   // GroupSize: x (fastest), y, z, 0 if unknown

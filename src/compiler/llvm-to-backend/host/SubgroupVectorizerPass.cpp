@@ -68,7 +68,7 @@ Constant *identity(int Op, Type *T, bool Signed) {
 class KernelVectorizer {
 public:
   KernelVectorizer(Function &K, unsigned S, std::array<uint64_t, 3> L)
-      : K{K}, M{*K.getParent()}, S{S}, L{L} {}
+      : K{K}, M{*K.getParent()}, S{S}, L{L}, W{L[0] * L[1] * L[2]} {}
 
   // false, with Why, if K stays scalar
   bool run(FunctionAnalysisManager &FAM);
@@ -79,12 +79,14 @@ private:
   Module &M;
   const unsigned S;
   const std::array<uint64_t, 3> L; // work-group size x, y, z
+  const uint64_t W;                // work-group size; the last sub-group has W - (W/S)·S lanes if not 0
   std::vector<rv::VectorMapping> ReduceMappings;
   SmallVector<CallInst *, 8> UniformCalls; // with side effects, still once per sub-group
 
   Function *reduceFunction(int Op, Type *T, StringRef TName);
   std::array<Value *, 3> localIds(IRBuilder<> &B, Value *SgFirst);
   bool rewriteBuiltins(Function &Lane);
+  void guardMissingLanes(Function &Lane);
   void replaceBody(Function &V);
   void erase(Function *F, FunctionAnalysisManager &FAM) {
     FAM.clear(*F, F->getName());
@@ -193,9 +195,13 @@ bool KernelVectorizer::rewriteBuiltins(Function &Lane) {
     else if (N.starts_with("get_group_id_")) New = Arg[1 + Dim];
     else if (N.starts_with("get_num_groups_")) New = Arg[4 + Dim];
     else if (N == "get_subgroup_local_id") New = RV("rv_lane_id", {});
-    else if (N == "get_subgroup_size" || N == "get_subgroup_max_size") New = ConstantInt::get(T, S);
+    else if (N == "get_subgroup_max_size") New = ConstantInt::get(T, S);
+    else if (N == "get_subgroup_size") // the last sub-group may be partial: min(S, W - sg_first)
+      New = W % S ? B.CreateTrunc(B.CreateBinaryIntrinsic(Intrinsic::umin, B.CreateSub(B.getInt64(W), Arg[0]),
+                                                          B.getInt64(S)), T)
+                  : ConstantInt::get(T, S);
     else if (N == "get_subgroup_id") New = B.CreateTrunc(B.CreateUDiv(Arg[0], B.getInt64(S)), T);
-    else if (N == "get_num_subgroups") New = ConstantInt::get(T, L[0] * L[1] * L[2] / S);
+    else if (N == "get_num_subgroups") New = ConstantInt::get(T, (W + S - 1) / S);
     else if (N == "hint_subgroup_size" || N == "sub_group_barrier") { // a sub-group is one vector
       C->eraseFromParent();
       continue;
@@ -232,6 +238,27 @@ bool KernelVectorizer::rewriteBuiltins(Function &Lane) {
     C->eraseFromParent();
   }
   return true;
+}
+
+// W not a multiple of S: the last sub-group lacks lanes, which must not run. RV's region entry
+// mask is all lanes, so Lane's body (after the allocas) becomes `if (sg_first + lane < W)`, which
+// RV linearizes into a mask on every access, call and collective in it.
+void KernelVectorizer::guardMissingLanes(Function &Lane) {
+  auto &Ctx = M.getContext();
+  auto &Entry = Lane.getEntryBlock();
+  auto Split = Entry.begin();
+  for (auto It = Entry.begin(); It != Entry.end(); ++It)
+    if (isa<AllocaInst>(*It))
+      Split = std::next(It);
+  auto *Body = Entry.splitBasicBlock(Split, "lanes");
+  auto *Missing = BasicBlock::Create(Ctx, "missing.lanes", &Lane);
+  ReturnInst::Create(Ctx, Missing);
+  IRBuilder<> B(Entry.getTerminator());
+  Value *Lin = B.CreateAdd(Lane.getArg(K.arg_size()),
+                           B.CreateZExt(B.CreateCall(M.getOrInsertFunction("rv_lane_id", B.getInt32Ty())),
+                                        B.getInt64Ty()));
+  B.CreateCondBr(B.CreateICmpULT(Lin, B.getInt64(W)), Body, Missing);
+  Entry.getTerminator()->eraseFromParent();
 }
 
 // K becomes one call of the vectorized code V per sub-group: CBS runs K as a 1D kernel whose
@@ -273,7 +300,7 @@ void KernelVectorizer::replaceBody(Function &V) {
   while (isa<AllocaInst>(*FirstNonAlloca))
     ++FirstNonAlloca;
   Entry.splitBasicBlock(FirstNonAlloca, "vectorized");
-  K.addFnAttr(cbs::SubgroupInstancesAttrName, std::to_string(L[0] * L[1] * L[2] / S));
+  K.addFnAttr(cbs::SubgroupInstancesAttrName, std::to_string((W + S - 1) / S));
 }
 
 bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
@@ -320,6 +347,8 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
   };
   if (!rewriteBuiltins(*Lane))
     return Finish(false);
+  if (W % S)
+    guardMissingLanes(*Lane);
 
   // RV widens scalar types only and copies a vector-typed value (e.g. a sycl::float3) once per
   // lane: split them, with their loads and stores, into scalars, so each component becomes one
@@ -400,12 +429,12 @@ PreservedAnalyses SubgroupVectorizerPass::run(Module &M, ModuleAnalysisManager &
     KernelVectorizer KV{*K, S, L};
     if (any_of(Skip, [&](StringRef P) { return StringRef(Name).contains(P); }))
       KV.Why = "ACPP_S2_VECTORIZE_SKIP";
-    else if (W == 0 || W % S)
-      KV.Why = W ? "the work-group size is not a multiple of the sub-group size"
-                 : "the work-group size is not known at JIT time";
+    else if (W == 0)
+      KV.Why = "the work-group size is not known at JIT time";
     else if (KV.run(FAM)) {
       HIPSYCL_DEBUG_INFO << "[SubgroupVectorizer] " << Name << ": vectorized at width " << S
-                         << ", " << W / S << " sub-groups per work-group\n";
+                         << ", " << (W + S - 1) / S << " sub-groups per work-group"
+                         << (W % S ? " (the last partial)" : "") << "\n";
       Changed = true;
       continue;
     }
