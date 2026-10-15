@@ -228,6 +228,46 @@ void vec_private_array(sycl::queue &q, In) {
   }, [=](size_t i, size_t) -> Opt { return float(-1 + 10 * int(i)); });
 }
 
+// GROMACS's i-force accumulators: a zeroed private array indexed by a uniform loop counter and
+// updated under a divergent branch. Its memset is lowered, so RV lays it out element-major: one
+// vector load and masked store per access instead of a gather and per-lane stores. The bound is
+// read from memory (8), so the loop is not unrolled and the array not promoted before RV.
+// RV: [SubgroupVectorizer] {{.*}}vec_private_accumRN{{.*}}: {{.*}} {{[1-9][0-9]*}} memset(s) lowered, {{[1-9][0-9]*}} private array(s) element-major
+// RV: [SubgroupVectorizer] {{.*}}vec_private_accumRN{{.*}}: vectorized at width 8
+// OK: vec_private_accum: ok
+void vec_private_accum(sycl::queue &q, In in) {
+  check(q, "vec_private_accum", [=](sycl::handler &h, float *o) {
+    h.parallel_for(sycl::nd_range<1>{N, WG}, [=](sycl::nd_item<1> it) {
+      const size_t i = it.get_global_id(0);
+      const int n = sycl::min(int(in.y[6]) + 2, 8);
+      float acc[8] = {};
+      for (int j = 0; j < 4; ++j)
+        for (int k = 0; k < n; ++k) {
+          const float v = in.x[(i + 3 * j + k) % N];
+          if (v > 6.f)
+            acc[k] += v / (v - 5.f);
+        }
+      float r = 0.f;
+      for (int k = 0; k < n; ++k)
+        r += acc[k] * float(k + 1);
+      o[i] = r;
+    });
+  }, [=](size_t i, size_t) -> Opt {
+    const int n = std::min(int(in.y[6]) + 2, 8);
+    float acc[8] = {};
+    for (int j = 0; j < 4; ++j)
+      for (int k = 0; k < n; ++k) {
+        const float v = in.x[(i + 3 * j + k) % N];
+        if (v > 6.f)
+          acc[k] += v / (v - 5.f);
+      }
+    float r = 0.f;
+    for (int k = 0; k < n; ++k)
+      r += acc[k] * float(k + 1);
+    return r;
+  });
+}
+
 // a lane-decreasing index (stride -1) in work-groups of 24 (3 sub-groups at S = 8): RV used to
 // build the lane offsets <0, -1, -2, ..> zero-extended (rv patch acpp_patch/contiguousVector.patch)
 // RV: [SubgroupVectorizer] {{.*}}vec_reverseRN{{.*}}: vectorized at width 8, 3 sub-groups per work-group
@@ -425,6 +465,7 @@ int main(int argc, char **) {
   vec_float2_local(q, in);
   vec_float2_loop(q, in);
   vec_private_array(q, in);
+  vec_private_accum(q, in);
   vec_reverse(q, in);
   vec_pinned(q, in);
   vec_pinned_update(q, in);

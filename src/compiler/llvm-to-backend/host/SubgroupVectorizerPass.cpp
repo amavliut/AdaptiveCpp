@@ -81,6 +81,7 @@ private:
   void alignLaneCopies(Function &Lane);
   SmallVector<Instruction *, 16> laneInvariantValues(Function &Lane);
   unsigned splitJoins(Function &Lane);
+  unsigned lowerPrivateMemsets(Function &Lane);
   void replaceBody(Function &V);
   void erase(Function *F, FunctionAnalysisManager &FAM) {
     FAM.clear(*F, F->getName());
@@ -415,6 +416,72 @@ unsigned KernelVectorizer::splitJoins(Function &Lane) {
   return Splits;
 }
 
+// Private arrays element-major. RV keeps one copy of a private array per lane (lane-major):
+//   lane0: acc[0] acc[1] ... acc[7] | lane1: acc[0] ... acc[7] | ... | lane7: ...
+// so acc[i] is a gather to read and per-lane stores (AVX2) or masked scatter (AVX512, SVE). RV's StructOpt
+// can store it element-major instead, when every access has a uniform index:
+//   acc[0]: lane0..lane7 | acc[1]: lane0..lane7 | ... | acc[7]: lane0..lane7
+// then acc[i] is one vector load / masked vector store. StructOpt rejects arrays with a memset user,
+// e.g. the zeroing `float acc[8] = {}`: a constant memset of a whole small array without padding
+// becomes one store per element, so StructOpt accepts the array.
+unsigned KernelVectorizer::lowerPrivateMemsets(Function &Lane) {
+  const auto &DL = M.getDataLayout();
+  unsigned Lowered = 0;
+  for (auto &I : make_early_inc_range(instructions(Lane))) {
+    auto *MS = dyn_cast<MemSetInst>(&I);
+    auto *A = MS ? dyn_cast<AllocaInst>(MS->getDest()) : nullptr;
+    auto *Len = MS ? dyn_cast<ConstantInt>(MS->getLength()) : nullptr;
+    auto *Byte = MS ? dyn_cast<ConstantInt>(MS->getValue()) : nullptr;
+    if (!A || !Len || !Byte || MS->isVolatile() ||
+        Len->getZExtValue() != DL.getTypeAllocSize(A->getAllocatedType()))
+      continue;
+    IRBuilder<> B(MS);
+    SmallVector<std::pair<Type *, SmallVector<Value *, 4>>, 16> Leaves; // element type, GEP indices
+    SmallVector<Value *, 4> Idx{B.getInt64(0)};
+    std::function<bool(Type *)> Collect = [&](Type *T) {
+      if (auto *AT = dyn_cast<ArrayType>(T)) {
+        for (uint64_t K = 0; K < AT->getNumElements(); ++K) {
+          Idx.push_back(B.getInt64(K));
+          if (!Collect(AT->getElementType()))
+            return false;
+          Idx.pop_back();
+        }
+        return true;
+      }
+      if (auto *ST = dyn_cast<StructType>(T)) {
+        for (unsigned K = 0; K < ST->getNumElements(); ++K) {
+          Idx.push_back(B.getInt32(K));
+          if (!Collect(ST->getElementType(K)))
+            return false;
+          Idx.pop_back();
+        }
+        return true;
+      }
+      Leaves.emplace_back(T, Idx);
+      return (T->isIntegerTy() || T->isFloatingPointTy()) && T->getPrimitiveSizeInBits() % 8 == 0 &&
+             Leaves.size() <= 64;
+    };
+    if (!Collect(A->getAllocatedType()))
+      continue;
+    uint64_t Bytes = 0;
+    for (auto &L : Leaves)
+      Bytes += DL.getTypeStoreSize(L.first);
+    if (Bytes != Len->getZExtValue())
+      continue;
+    for (auto &[T, LeafIdx] : Leaves) {
+      APInt Bits = APInt::getSplat(T->getPrimitiveSizeInBits(), Byte->getValue().trunc(8));
+      Constant *C = T->isIntegerTy() ? static_cast<Constant *>(ConstantInt::get(T, Bits))
+                                     : ConstantFP::get(T, APFloat(T->getFltSemantics(), Bits));
+      const uint64_t Offset = DL.getIndexedOffsetInType(A->getAllocatedType(), LeafIdx);
+      B.CreateAlignedStore(C, B.CreateInBoundsGEP(A->getAllocatedType(), A, LeafIdx),
+                           commonAlignment(A->getAlign(), Offset));
+    }
+    MS->eraseFromParent();
+    ++Lowered;
+  }
+  return Lowered;
+}
+
 // W not a multiple of S: the last sub-group lacks lanes, which must not run. RV's region entry
 // mask is all lanes, so Lane's body (after the allocas) becomes `if (sg_first + lane < W)`, which
 // RV linearizes into a mask on every access, call and collective in it.
@@ -547,6 +614,9 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     FAM.getResult<LoopAnalysis>(*Lane); // RV reads it via getCachedResult
   }
   alignLaneCopies(*Lane);
+  // ACPP_S2_VECTORIZE_PRIVATE=0 keeps the memsets (A/B profiling)
+  const unsigned Memsets =
+      getEnvironmentVariableOrDefault<int>("VECTORIZE_PRIVATE", 1) ? lowerPrivateMemsets(*Lane) : 0;
   if (verifyFunction(*Lane, &errs())) {
     Why = "invalid per-lane function";
     return Finish(false);
@@ -595,9 +665,15 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     return Finish(false);
   }
 
+  unsigned ElementMajor = 0; // private arrays RV's StructOpt laid out [N x <S x T>]
+  for (auto &I : instructions(*V))
+    if (auto *A = dyn_cast<AllocaInst>(&I))
+      if (auto *AT = dyn_cast<ArrayType>(A->getAllocatedType()))
+        ElementMajor += isa<FixedVectorType>(AT->getElementType());
   HIPSYCL_DEBUG_INFO << "[SubgroupVectorizer] " << K.getName() << ": " << Pinned.size()
                      << " lane-invariant value(s) pinned uniform, " << Joins << " join(s) split, "
-                     << UniformBranches << " of " << Branches << " branch(es) uniform\n";
+                     << UniformBranches << " of " << Branches << " branch(es) uniform, " << Memsets
+                     << " memset(s) lowered, " << ElementMajor << " private array(s) element-major\n";
   replaceBody(*V);
   return Finish(true);
 }
