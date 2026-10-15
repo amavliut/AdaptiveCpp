@@ -105,6 +105,7 @@ add_executable(sycl_tests
   sycl/reference_semantics.cpp
   sycl/relational.cpp
   sycl/sub_group.cpp
+  sycl/sub_group_fission.cpp
   sycl/sycl_test_suite.cpp 
   sycl/usm.cpp
   sycl/vec.cpp
