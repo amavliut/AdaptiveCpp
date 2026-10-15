@@ -35,3 +35,11 @@ if "ACPP_VISIBILITY_MASK" in os.environ:
   backends = [ b.split(':')[0] for b in backend_masks]
   for b in backends:
     config.available_features.add(b)
+
+# 'rv': AdaptiveCpp built WITH_RV, i.e. its host JIT has the sub-group vectorizer
+host_lib = os.path.join(os.path.dirname(os.path.dirname(config.acpp_compiler)),
+                        'lib', 'hipSYCL', 'llvm-to-backend', 'libllvm-to-host.so')
+if os.path.exists(host_lib):
+  with open(host_lib, 'rb') as f:
+    if b'[SubgroupVectorizer]' in f.read():
+      config.available_features.add('rv')
