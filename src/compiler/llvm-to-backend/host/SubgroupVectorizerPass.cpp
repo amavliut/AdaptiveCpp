@@ -11,6 +11,7 @@
 #include "hipSYCL/compiler/llvm-to-backend/host/SubgroupVectorizerPass.hpp"
 #include "hipSYCL/common/debug.hpp"
 #include "hipSYCL/compiler/cbs/IRUtils.hpp"
+#include "hipSYCL/compiler/cbs/SubgroupOps.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
 
 #include <rv/PlatformInfo.h>
@@ -41,8 +42,6 @@
 #include <llvm/Transforms/Utils/LCSSA.h>
 #include <llvm/Transforms/Utils/LoopSimplify.h>
 
-#include <cmath>
-
 namespace hipsycl::compiler {
 namespace {
 using namespace llvm;
@@ -50,20 +49,7 @@ using namespace llvm;
 // arguments the per-lane function gets after the kernel's: sg_first (linear local id of lane 0),
 // group ids x y z, numbers of groups x y z
 constexpr unsigned NumIdArgs = 7;
-constexpr char ReducePrefix[] = "acpp_rv_reduce.";
-
-// identity of __acpp_sscp_algorithm_op plus/multiply/min/max for type T (Signed: from the name)
-Constant *identity(int Op, Type *T, bool Signed) {
-  if (T->isFloatingPointTy()) {
-    const double V[] = {0.0, 1.0, INFINITY, -INFINITY};
-    return ConstantFP::get(T, V[Op]);
-  }
-  const unsigned W = T->getIntegerBitWidth();
-  const APInt V[] = {APInt(W, 0), APInt(W, 1),
-                     Signed ? APInt::getSignedMaxValue(W) : APInt::getMaxValue(W),
-                     Signed ? APInt::getSignedMinValue(W) : APInt::getMinValue(W)};
-  return ConstantInt::get(T, V[Op]);
-}
+constexpr char CollectivePrefix[] = "acpp_rv_sg."; // mapped collectives (KernelVectorizer::collective)
 
 class KernelVectorizer {
 public:
@@ -80,13 +66,14 @@ private:
   const unsigned S;
   const std::array<uint64_t, 3> L; // work-group size x, y, z
   const uint64_t W;                // work-group size; the last sub-group has W - (W/S)·S lanes if not 0
-  std::vector<rv::VectorMapping> ReduceMappings;
+  std::vector<rv::VectorMapping> Mappings; // of the collectives' vector functions
   SmallVector<CallInst *, 8> UniformCalls; // with side effects, still once per sub-group
 
-  Function *reduceFunction(int Op, Type *T, StringRef TName);
+  Value *collective(IRBuilder<> &B, const sgops::Collective &Coll, CallInst &C);
   std::array<Value *, 3> localIds(IRBuilder<> &B, Value *SgFirst);
   bool rewriteBuiltins(Function &Lane);
   void guardMissingLanes(Function &Lane);
+  void alignLaneCopies(Function &Lane);
   void replaceBody(Function &V);
   void erase(Function *F, FunctionAnalysisManager &FAM) {
     FAM.clear(*F, F->getName());
@@ -94,36 +81,56 @@ private:
   }
 };
 
-// T reduce(T x) for the per-lane code, with its masked vector version
-// <S x T> reduce_v(<S x T> x, <S x i1> mask): inactive lanes contribute the identity. The result
-// is splat: RV maps every resolved call result as a vector (NatBuilder::vectorizeCallInstruction).
-Function *KernelVectorizer::reduceFunction(int Op, Type *T, StringRef TName) {
-  const std::string Name = (ReducePrefix + Twine(Op) + "." + TName).str();
-  if (auto *F = M.getFunction(Name))
-    return F;
-  auto *Scalar =
-      Function::Create(FunctionType::get(T, {T}, false), Function::ExternalLinkage, Name, M);
-  auto *VecT = FixedVectorType::get(T, S);
-  auto *MaskT = FixedVectorType::get(Type::getInt1Ty(M.getContext()), S);
-  auto *Vector = Function::Create(FunctionType::get(VecT, {VecT, MaskT}, false),
-                                  Function::InternalLinkage, Name + "_v", M);
-  IRBuilder<> B(BasicBlock::Create(M.getContext(), "entry", Vector));
-  const bool Signed = TName.starts_with("i"), FP = T->isFloatingPointTy();
-  Value *X = B.CreateSelect(
-      Vector->getArg(1), Vector->getArg(0),
-      ConstantVector::getSplat(ElementCount::getFixed(S), identity(Op, T, Signed)));
-  FastMathFlags FMF;
-  FMF.setAllowReassoc(); // any order is allowed for a group reduction; else LLVM adds in sequence
-  B.setFastMathFlags(FMF);
-  Value *R = Op == 0   ? (FP ? B.CreateFAddReduce(ConstantFP::get(T, -0.0), X) : B.CreateAddReduce(X))
-             : Op == 1 ? (FP ? B.CreateFMulReduce(ConstantFP::get(T, 1.0), X) : B.CreateMulReduce(X))
-             : Op == 2 ? (FP ? B.CreateFPMinReduce(X) : B.CreateIntMinReduce(X, Signed))
-                       : (FP ? B.CreateFPMaxReduce(X) : B.CreateIntMaxReduce(X, Signed));
-  B.CreateRet(B.CreateVectorSplat(S, R));
-  ReduceMappings.emplace_back(Scalar, Vector, S, /*maskPos*/ 1, rv::VectorShape::varying(),
-                              rv::VectorShapeVec{rv::VectorShape::varying()},
-                              rv::CallPredicateMode::PredicateArg);
-  return Scalar;
+// A sub-group collective C as a call of `T acpp_rv_sg.<builtin>[.<op> | .c<constant>](per-lane args)`,
+// which RV maps to a masked vector function built with V1's operations (SubgroupOps.hpp): for
+// reduce and scans inactive lanes contribute the identity, then the builtins' tree order (results
+// as on the scalar path); a constant shuffle operand is part of the function, so it is one
+// shufflevector. RV maps every resolved call result as a vector, so reduce returns a splat.
+Value *KernelVectorizer::collective(IRBuilder<> &B, const sgops::Collective &Coll, CallInst &C) {
+  using Kind = sgops::Collective::Kind;
+  const bool HasOp = Coll.K == Kind::Reduce || Coll.K == Kind::InclusiveScan || Coll.K == Kind::ExclusiveScan;
+  const unsigned Op = HasOp ? cast<ConstantInt>(C.getArgOperand(0))->getZExtValue() : 0;
+  std::string Name = (CollectivePrefix + C.getCalledFunction()->getName().drop_front(12)).str();
+  SmallVector<Value *, 2> Args; // per lane
+  ConstantInt *Const = nullptr;
+  if (HasOp) { // (op, x) or (op, x, init)
+    Name += "." + std::to_string(Op);
+    Args.append(C.arg_begin() + 1, C.arg_end());
+  } else { // (x, delta / mask / id)
+    Args.push_back(C.getArgOperand(0));
+    if ((Const = dyn_cast<ConstantInt>(C.getArgOperand(1))))
+      Name += ".c" + std::to_string(Const->getSExtValue());
+    else
+      Args.push_back(C.getArgOperand(1));
+  }
+  auto *F = M.getFunction(Name);
+  if (!F) {
+    SmallVector<Type *, 3> Tys, VecTys;
+    for (auto *A : Args) {
+      Tys.push_back(A->getType());
+      VecTys.push_back(FixedVectorType::get(A->getType(), S));
+    }
+    VecTys.push_back(FixedVectorType::get(B.getInt1Ty(), S)); // the mask, last
+    F = Function::Create(FunctionType::get(C.getType(), Tys, false), Function::ExternalLinkage, Name, M);
+    auto *V = Function::Create(FunctionType::get(FixedVectorType::get(C.getType(), S), VecTys, false),
+                               Function::InternalLinkage, Name + "_v", M);
+    IRBuilder<> VB(BasicBlock::Create(M.getContext(), "entry", V));
+    Value *X = V->getArg(0), *R;
+    if (HasOp) {
+      X = VB.CreateSelect(V->getArg(Args.size()), X,
+                          ConstantVector::getSplat(ElementCount::getFixed(S),
+                                                   sgops::identity(Op, Coll.Class, C.getType())));
+      R = Coll.K == Kind::Reduce          ? sgops::reduce(VB, Op, Coll.Class, X, VB.getInt64(S), S)
+          : Coll.K == Kind::InclusiveScan ? sgops::inclusiveScan(VB, Op, Coll.Class, X, S)
+                                          : sgops::exclusiveScan(VB, Op, Coll.Class, X, V->getArg(1), S);
+    } else
+      R = sgops::shuffle(VB, Coll.K, X, Const ? static_cast<Value *>(Const) : V->getArg(1), S);
+    VB.CreateRet(R);
+    Mappings.emplace_back(F, V, S, /*maskPos*/ int(Args.size()), rv::VectorShape::varying(),
+                          rv::VectorShapeVec(Args.size(), rv::VectorShape::varying()),
+                          rv::CallPredicateMode::PredicateArg);
+  }
+  return B.CreateCall(F, Args);
 }
 
 // Local ids from sg_first + lane. A sub-group inside one x row (LX % S == 0) has x contiguous and
@@ -185,10 +192,6 @@ bool KernelVectorizer::rewriteBuiltins(Function &Lane) {
         Tys.push_back(A->getType());
       return B.CreateCall(M.getOrInsertFunction(Name, FunctionType::get(T, Tys, false)), Args);
     };
-    auto Shuffle = [&](Value *Amount) -> Value * { // lane i gets x[i + Amount], constant only
-      return isa<ConstantInt>(Amount) ? RV(("rv_shuffle." + N).str(), {C->getArgOperand(0), Amount})
-                                      : nullptr;
-    };
     Value *New = nullptr;
     if (N.starts_with("get_local_id_")) New = Lid[Dim];
     else if (N.starts_with("get_local_size_")) New = B.getInt64(L[Dim]);
@@ -205,20 +208,14 @@ bool KernelVectorizer::rewriteBuiltins(Function &Lane) {
     else if (N == "hint_subgroup_size" || N == "sub_group_barrier") { // a sub-group is one vector
       C->eraseFromParent();
       continue;
-    } else if (N.consume_front("sub_group_shl_")) New = Shuffle(C->getArgOperand(1));
-    else if (N.consume_front("sub_group_shr_"))
-      New = Shuffle(isa<Constant>(C->getArgOperand(1))
-                        ? ConstantExpr::getNeg(cast<Constant>(C->getArgOperand(1))) : C->getArgOperand(1));
-    else if (N.consume_front("sub_group_broadcast_")) // (sender, x)
+    } else if (N.consume_front("sub_group_broadcast_")) // (sender, x)
       New = RV(("rv_extract." + N).str(), {C->getArgOperand(1), C->getArgOperand(0)});
     else if (N == "sub_group_any") New = RV("rv_any", {C->getArgOperand(0)});
     else if (N == "sub_group_all") New = RV("rv_all", {C->getArgOperand(0)});
     else if (N == "sub_group_none") New = B.CreateNot(RV("rv_any", {C->getArgOperand(0)}));
-    else if (N.consume_front("sub_group_reduce_")) { // (op, x), op plus/multiply/min/max
-      auto *Op = dyn_cast<ConstantInt>(C->getArgOperand(0));
-      if (Op && Op->getZExtValue() <= 3)
-        New = B.CreateCall(reduceFunction(Op->getZExtValue(), T, N), {C->getArgOperand(1)});
-    } else if (N == "rsqrt_f32" || N == "rsqrt_f64") // as the host libkernel: 1 / sqrt(x)
+    else if (auto Coll = sgops::parse(N); Coll && sgops::isSupported(*Coll, *C)) // shuffles, reduce, scans
+      New = collective(B, *Coll, *C);
+    else if (N == "rsqrt_f32" || N == "rsqrt_f64") // as the host libkernel: 1 / sqrt(x)
       New = B.CreateFDiv(ConstantFP::get(T, 1.0),
                          B.CreateUnaryIntrinsic(Intrinsic::sqrt, C->getArgOperand(0)));
     else if (N == "popcount_u32" || N == "popcount_u64")
@@ -238,6 +235,38 @@ bool KernelVectorizer::rewriteBuiltins(Function &Lane) {
     C->eraseFromParent();
   }
   return true;
+}
+
+// RV gives each lane its own copy of a private array, the S copies back to back, but keeps the
+// accesses' alignment: a lane's copy is aligned only to gcd(alignment, size). Lower the alloca's
+// and its accesses' alignment to that (else `int r[6] = {-1, ..}`, a 24-byte memset `align 16`,
+// becomes aligned 16-byte stores on 8-byte aligned lanes: a fault).
+void KernelVectorizer::alignLaneCopies(Function &Lane) {
+  const auto &DL = M.getDataLayout();
+  for (auto &I : Lane.getEntryBlock()) {
+    auto *A = dyn_cast<AllocaInst>(&I);
+    auto Size = A ? A->getAllocationSize(DL) : std::nullopt;
+    if (!Size || Size->isScalable())
+      continue;
+    const Align LaneAlign = commonAlignment(A->getAlign(), Size->getFixedValue());
+    if (LaneAlign == A->getAlign())
+      continue;
+    A->setAlignment(LaneAlign);
+    SmallVector<Value *, 8> Ptrs{A}; // A and pointers derived from it
+    while (!Ptrs.empty())
+      for (auto *U : Ptrs.pop_back_val()->users())
+        if (isa<GetElementPtrInst, CastInst>(U))
+          Ptrs.push_back(U);
+        else if (auto *L = dyn_cast<LoadInst>(U))
+          L->setAlignment(std::min(L->getAlign(), LaneAlign));
+        else if (auto *St = dyn_cast<StoreInst>(U))
+          St->setAlignment(std::min(St->getAlign(), LaneAlign)); // also if A is the stored value: harmless
+        else if (auto *MI = dyn_cast<MemIntrinsic>(U)) {
+          MI->setDestAlignment(std::min(MI->getDestAlign().valueOrOne(), LaneAlign));
+          if (auto *MT = dyn_cast<MemTransferInst>(MI))
+            MT->setSourceAlignment(std::min(MT->getSourceAlign().valueOrOne(), LaneAlign));
+        }
+  }
 }
 
 // W not a multiple of S: the last sub-group lacks lanes, which must not run. RV's region entry
@@ -285,12 +314,12 @@ void KernelVectorizer::replaceBody(Function &V) {
   B.CreateRetVoid();
   InlineFunctionInfo IFI;
   InlineFunction(*Call, IFI);
-  SmallVector<CallInst *, 4> Reductions; // masked vector reductions
+  SmallVector<CallInst *, 4> Collectives; // their vector functions
   for (auto &I : instructions(K))
     if (auto *C = dyn_cast<CallInst>(&I);
-        C && C->getCalledFunction() && C->getCalledFunction()->getName().starts_with(ReducePrefix))
-      Reductions.push_back(C);
-  for (auto *C : Reductions)
+        C && C->getCalledFunction() && C->getCalledFunction()->getName().starts_with(CollectivePrefix))
+      Collectives.push_back(C);
+  for (auto *C : Collectives)
     InlineFunction(*C, IFI);
   // CBS keeps the entry block out of its sub-CFGs and does not give an alloca with a user there
   // (as RV's per-lane pointers into its replicated allocas) a copy per work-item (sub-group):
@@ -335,12 +364,12 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     for (auto *F : {Lane, V})
       if (F)
         erase(F, FAM);
-    for (auto &F : make_early_inc_range(M)) // scalar reductions, RV intrinsics
+    for (auto &F : make_early_inc_range(M)) // scalar collectives, RV intrinsics
       if (F.isDeclaration() && F.use_empty() &&
-          (F.getName().starts_with(ReducePrefix) || F.getName().starts_with("rv_")))
+          (F.getName().starts_with(CollectivePrefix) || F.getName().starts_with("rv_")))
         F.eraseFromParent();
-    for (auto &F : make_early_inc_range(M)) // vector reductions not inlined (failure)
-      if (F.getName().starts_with(ReducePrefix) && F.use_empty())
+    for (auto &F : make_early_inc_range(M)) // vector functions not inlined (failure)
+      if (F.getName().starts_with(CollectivePrefix) && F.use_empty())
         erase(&F, FAM);
     FAM.invalidate(K, PreservedAnalyses::none());
     return Ok;
@@ -368,6 +397,7 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     FAM.invalidate(*Lane, PreservedAnalyses::none());
     FAM.getResult<LoopAnalysis>(*Lane); // RV reads it via getCachedResult
   }
+  alignLaneCopies(*Lane);
   if (verifyFunction(*Lane, &errs())) {
     Why = "invalid per-lane function";
     return Finish(false);
@@ -378,7 +408,7 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
   bool Ok;
   {
     rv::PlatformInfo PI(M, nullptr, nullptr); // RV uses neither TTI nor TLI
-    for (auto &Mapping : ReduceMappings)
+    for (auto &Mapping : Mappings)
       PI.addMapping(Mapping);
     rv::VectorShapeVec ArgShapes(Lane->arg_size(), rv::VectorShape::uni());
     ArgShapes[K.arg_size()] = rv::VectorShape::uni(S);
