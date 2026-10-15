@@ -42,6 +42,10 @@
 #include <llvm/Transforms/Utils/LCSSA.h>
 #include <llvm/Transforms/Utils/LoopSimplify.h>
 
+#include <functional>
+#include <memory>
+#include <optional>
+
 namespace hipsycl::compiler {
 namespace {
 using namespace llvm;
@@ -74,6 +78,7 @@ private:
   bool rewriteBuiltins(Function &Lane);
   void guardMissingLanes(Function &Lane);
   void alignLaneCopies(Function &Lane);
+  SmallVector<Instruction *, 16> laneInvariantValues(Function &Lane);
   void replaceBody(Function &V);
   void erase(Function *F, FunctionAnalysisManager &FAM) {
     FAM.clear(*F, F->getName());
@@ -269,6 +274,103 @@ void KernelVectorizer::alignLaneCopies(Function &Lane) {
   }
 }
 
+// values that depend on the lane but are equal in all lanes of every sub-group, e.g.
+// GROMACS's `tidx / 8` at S = 8 in 4x4 work-groups: RV has no periodic shape (lid.x = lane % 4)
+// and calls them varying. W and S are known, so an expression of only sg_first, rv_lane_id and
+// constants is evaluated for every (sub-group k: sg_first = k·S, lane); equal in all S lanes of
+// every sub-group (missing lanes of a partial one included, so the missing-lane guard never
+// qualifies) means uniform. Pinned uniform, RV keeps branches on them and computes them once, from
+// lane 0 of their operands.
+SmallVector<Instruction *, 16> KernelVectorizer::laneInvariantValues(Function &Lane) {
+  const unsigned N = (W + S - 1) / S * S; // index k·S + lane
+  struct Values {
+    SmallVector<APInt, 0> At; // per (sub-group, lane)
+    bool Lane;                // depends on rv_lane_id
+  };
+  DenseMap<Value *, std::unique_ptr<Values>> Memo; // stable storage: Ops outlives insertions
+  Value *SgFirst = Lane.getArg(K.arg_size());
+  std::function<const Values *(Value *)> Eval = [&](Value *X) -> const Values * {
+    if (auto It = Memo.find(X); It != Memo.end())
+      return It->second.get();
+    Memo[X] = nullptr; // also breaks cycles
+    auto *T = dyn_cast<IntegerType>(X->getType());
+    if (!T || T->getBitWidth() > 64)
+      return nullptr;
+    const unsigned BW = T->getBitWidth();
+    Values R{{}, false};
+    auto *C = dyn_cast<CallInst>(X);
+    if (auto *CI = dyn_cast<ConstantInt>(X))
+      R.At.assign(N, CI->getValue());
+    else if (X == SgFirst)
+      for (unsigned I = 0; I < N; ++I)
+        R.At.push_back(APInt(BW, I / S * S));
+    else if (C && C->getCalledFunction() && C->getCalledFunction()->getName() == "rv_lane_id") {
+      for (unsigned I = 0; I < N; ++I)
+        R.At.push_back(APInt(BW, I % S));
+      R.Lane = true;
+    } else if (auto *I = dyn_cast<Instruction>(X)) {
+      SmallVector<const Values *, 3> Ops;
+      for (Value *O : I->operands()) {
+        auto *E = Eval(O);
+        if (!E)
+          return nullptr;
+        Ops.push_back(E);
+        R.Lane |= E->Lane;
+      }
+      for (unsigned J = 0; J < N; ++J) {
+        auto A = [&](unsigned K) -> const APInt & { return Ops[K]->At[J]; };
+        std::optional<APInt> V;
+        if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+          const bool Div = BO->isIntDivRem(), Shift = BO->isShift();
+          if ((Div && A(1).isZero()) || (Shift && A(1).uge(BW)))
+            return nullptr;
+          switch (BO->getOpcode()) {
+          case Instruction::Add: V = A(0) + A(1); break;
+          case Instruction::Sub: V = A(0) - A(1); break;
+          case Instruction::Mul: V = A(0) * A(1); break;
+          case Instruction::UDiv: V = A(0).udiv(A(1)); break;
+          case Instruction::SDiv: V = A(0).sdiv(A(1)); break;
+          case Instruction::URem: V = A(0).urem(A(1)); break;
+          case Instruction::SRem: V = A(0).srem(A(1)); break;
+          case Instruction::Shl: V = A(0).shl(A(1)); break;
+          case Instruction::LShr: V = A(0).lshr(A(1)); break;
+          case Instruction::AShr: V = A(0).ashr(A(1)); break;
+          case Instruction::And: V = A(0) & A(1); break;
+          case Instruction::Or: V = A(0) | A(1); break;
+          case Instruction::Xor: V = A(0) ^ A(1); break;
+          default: return nullptr;
+          }
+        } else if (auto *Cast = dyn_cast<CastInst>(I)) {
+          if (Cast->getOpcode() == Instruction::ZExt) V = A(0).zext(BW);
+          else if (Cast->getOpcode() == Instruction::SExt) V = A(0).sext(BW);
+          else if (Cast->getOpcode() == Instruction::Trunc) V = A(0).trunc(BW);
+          else return nullptr;
+        } else if (auto *Cmp = dyn_cast<ICmpInst>(I))
+          V = APInt(1, ICmpInst::compare(A(0), A(1), Cmp->getPredicate()));
+        else if (isa<SelectInst>(I))
+          V = A(0).getBoolValue() ? A(1) : A(2);
+        else
+          return nullptr;
+        R.At.push_back(*V);
+      }
+    } else
+      return nullptr; // other arguments, loads, phis, calls: not evaluated
+    return (Memo[X] = std::make_unique<Values>(std::move(R))).get();
+  };
+  SmallVector<Instruction *, 16> Invariant;
+  for (auto &I : instructions(Lane)) {
+    auto *E = Eval(&I);
+    if (!E || !E->Lane)
+      continue;
+    bool Same = true;
+    for (unsigned J = 0; J < N && Same; ++J)
+      Same = E->At[J] == E->At[J / S * S];
+    if (Same)
+      Invariant.push_back(&I);
+  }
+  return Invariant;
+}
+
 // W not a multiple of S: the last sub-group lacks lanes, which must not run. RV's region entry
 // mask is all lanes, so Lane's body (after the allocas) becomes `if (sg_first + lane < W)`, which
 // RV linearizes into a mask on every access, call and collective in it.
@@ -402,6 +504,9 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     Why = "invalid per-lane function";
     return Finish(false);
   }
+  SmallVector<Instruction *, 16> Pinned; // ACPP_S2_VECTORIZE_PIN=0 disables it
+  if (getEnvironmentVariableOrDefault<int>("VECTORIZE_PIN", 1))
+    Pinned = laneInvariantValues(*Lane);
 
   // RV, after the rv_* declarations exist (PlatformInfo registers them when created). All
   // arguments are uniform; sg_first is a multiple of S.
@@ -421,6 +526,8 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     rv::VectorizationInfo VecInfo(R, Mapping);
     for (auto *C : UniformCalls) // barriers have side effects: RV would call them once per lane
       VecInfo.setPinnedShape(*C, rv::VectorShape::uni());
+    for (auto *I : Pinned) // lane-invariant 
+      VecInfo.setPinnedShape(*I, rv::VectorShape::uni());
     rv::Config Cfg = rv::Config::createDefaultConfig();
     const auto Features = sys::getHostCPUFeatures();
     Cfg.useAVX = Cfg.useAVX2 = Features.lookup("avx2");
@@ -435,6 +542,8 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     return Finish(false);
   }
 
+  HIPSYCL_DEBUG_INFO << "[SubgroupVectorizer] " << K.getName() << ": " << Pinned.size()
+                     << " lane-invariant value(s) pinned uniform\n";
   replaceBody(*V);
   return Finish(true);
 }

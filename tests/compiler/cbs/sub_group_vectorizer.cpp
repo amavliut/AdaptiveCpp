@@ -247,6 +247,34 @@ void vec_reverse(sycl::queue &q, In in) {
   });
 }
 
+// GROMACS's imask shape: 4 x 4 work-groups, S = 8, lid.x = lane % 4 is periodic for RV, so
+// tidx / 8 looks lane dependent but is the same in a sub-group; pinned uniform, the mask loaded
+// with it and the branches on its bits stay uniform (no masking)
+// RV: [SubgroupVectorizer] {{.*}}vec_pinnedRN{{.*}}: {{[1-9][0-9]*}} lane-invariant value(s) pinned uniform
+// RV: [SubgroupVectorizer] {{.*}}vec_pinnedRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group
+// OK: vec_pinned: ok
+void vec_pinned(sycl::queue &q, In in) {
+  check(q, "vec_pinned", [=](sycl::handler &h, float *o) {
+    h.parallel_for(sycl::nd_range<2>{{8, 8}, {4, 4}}, [=](sycl::nd_item<2> it) {
+      const size_t i = it.get_global_linear_id(), tidx = it.get_local_linear_id();
+      const unsigned m = unsigned(in.y[it.get_group_linear_id() * 2 + tidx / 8]); // per sub-group
+      float r = 0.f;
+      for (unsigned b = 0; b < 3; ++b)
+        if ((m >> b) & 1u)
+          r += in.x[b * 16 + tidx];
+      o[i] = r;
+    });
+  }, [=](size_t i, size_t) -> Opt {
+    const size_t r0 = i / 8, c0 = i % 8, g = r0 / 4 * 2 + c0 / 4, tidx = r0 % 4 * 4 + c0 % 4;
+    const unsigned m = unsigned(in.y[g * 2 + tidx / 8]);
+    float r = 0.f;
+    for (unsigned b = 0; b < 3; ++b)
+      if ((m >> b) & 1u)
+        r += in.x[b * 16 + tidx];
+    return r;
+  });
+}
+
 // work-groups of 12: at S = 8 sub-groups of 8 and 4 lanes; the missing lanes are masked off
 // RV: [SubgroupVectorizer] {{.*}}vec_partialRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group (the last partial)
 // OK: vec_partial: ok
@@ -354,6 +382,7 @@ int main(int argc, char **) {
   vec_float2_loop(q, in);
   vec_private_array(q, in);
   vec_reverse(q, in);
+  vec_pinned(q, in);
   vec_partial(q, in);
   vec_partial_barrier(q, in);
   vec_partial_2d(q, in);
