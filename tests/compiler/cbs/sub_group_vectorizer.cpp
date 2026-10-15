@@ -275,6 +275,50 @@ void vec_pinned(sycl::queue &q, In in) {
   });
 }
 
+// GROMACS's prune kernel: the per-sub-group mask is also updated in the loop (a bit cleared when
+// no lane of the sub-group needs it) under the uniform branch on that bit, whose join is also the
+// one of a divergent branch inside; the joins are split, so the mask stays uniform: all branches
+// but that one (without the split, the mask and the branches on it are varying)
+// RV: [SubgroupVectorizer] {{.*}}vec_pinned_updateRN{{.*}}: {{[1-9][0-9]*}} lane-invariant value(s) pinned uniform, {{[1-9][0-9]*}} join(s) split, [[#U:]] of
+// RV-SAME: [[#U+1]] branch(es) uniform
+// RV: [SubgroupVectorizer] {{.*}}vec_pinned_updateRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group
+// OK: vec_pinned_update: ok
+void vec_pinned_update(sycl::queue &q, In in) {
+  check(q, "vec_pinned_update", [=](sycl::handler &h, float *o) {
+    h.parallel_for(sycl::nd_range<2>{{8, 8}, {4, 4}}, [=](sycl::nd_item<2> it) {
+      auto sg = it.get_sub_group();
+      const size_t i = it.get_global_linear_id(), tidx = it.get_local_linear_id();
+      unsigned m = unsigned(in.y[it.get_group_linear_id() * 2 + tidx / sg.get_max_local_range()[0]]) | 8u;
+      float r = 0.f;
+      for (unsigned b = 0; b < 4; ++b)
+        if ((m >> b) & 1u) {
+          const float v = in.x[b * 16 + tidx];
+          if (!sycl::any_of_group(sg, v > 11.f))
+            m &= ~(1u << b);
+          if (v > 6.f) // divergent, too costly to become a select
+            r += v / (v - 5.f) + sycl::sqrt(v);
+        }
+      o[i] = r + 100.f * float(m);
+    });
+  }, [=](size_t i, size_t S) -> Opt {
+    const size_t r0 = i / 8, c0 = i % 8, g = r0 / 4 * 2 + c0 / 4, tidx = r0 % 4 * 4 + c0 % 4;
+    unsigned m = unsigned(in.y[g * 2 + tidx / S]) | 8u;
+    float r = 0.f;
+    for (unsigned b = 0; b < 4; ++b)
+      if ((m >> b) & 1u) {
+        bool Any = false;
+        for (size_t t = tidx / S * S; t < tidx / S * S + S; ++t)
+          Any |= in.x[b * 16 + t] > 11.f;
+        if (!Any)
+          m &= ~(1u << b);
+        const float v = in.x[b * 16 + tidx];
+        if (v > 6.f)
+          r += v / (v - 5.f) + std::sqrt(v);
+      }
+    return r + 100.f * float(m);
+  });
+}
+
 // work-groups of 12: at S = 8 sub-groups of 8 and 4 lanes; the missing lanes are masked off
 // RV: [SubgroupVectorizer] {{.*}}vec_partialRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group (the last partial)
 // OK: vec_partial: ok
@@ -383,6 +427,7 @@ int main(int argc, char **) {
   vec_private_array(q, in);
   vec_reverse(q, in);
   vec_pinned(q, in);
+  vec_pinned_update(q, in);
   vec_partial(q, in);
   vec_partial_barrier(q, in);
   vec_partial_2d(q, in);

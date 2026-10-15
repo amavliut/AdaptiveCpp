@@ -37,6 +37,7 @@
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/Scalarizer.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/BreakCriticalEdges.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/LCSSA.h>
@@ -79,6 +80,7 @@ private:
   void guardMissingLanes(Function &Lane);
   void alignLaneCopies(Function &Lane);
   SmallVector<Instruction *, 16> laneInvariantValues(Function &Lane);
+  unsigned splitJoins(Function &Lane);
   void replaceBody(Function &V);
   void erase(Function *F, FunctionAnalysisManager &FAM) {
     FAM.clear(*F, F->getName());
@@ -371,6 +373,48 @@ SmallVector<Instruction *, 16> KernelVectorizer::laneInvariantValues(Function &L
   return Invariant;
 }
 
+// problem:
+// latch:  m_next = phi [m,  skip-A],          ← A not taken
+//                      [m', B-not-taken],
+//                      [m', B-taken]
+// latch is the join of both A (uniform) and B (divergent). RV makes a phi in the join of a divergent
+// branch varying unless all incoming values are equal (m != m'), so m_next is varying, although all
+// lanes arrive from skip-A together (A is uniform) and both B paths bring the same m'. Through the
+// loop, m and A become varying too.
+// Split: B's two paths get their own join; there m' comes from both, so it needs no phi. latch then
+// joins A only: m_next = phi [m, skip-A], [m', B-join] is the join of a uniform branch, so uniform,
+// and m and A stay uniform through the loop.
+unsigned KernelVectorizer::splitJoins(Function &Lane) {
+  DominatorTree DT(Lane);
+  LoopInfo LI(DT);
+  unsigned Splits = 0;
+  SmallVector<BasicBlock *, 32> Work;
+  for (auto &BB : Lane)
+    Work.push_back(&BB);
+  while (!Work.empty()) {
+    auto *J = Work.pop_back_val();
+    auto *Node = DT.getNode(J);
+    auto *L = LI.getLoopFor(J);
+    if (!Node || !Node->getIDom() || pred_size(J) < 3 || !isa<PHINode>(J->front()) ||
+        (L && L->getHeader() == J))
+      continue;
+    auto *D = Node->getIDom()->getBlock();
+    for (auto *Succ : successors(D)) { // critical edges are split: each predecessor has J only
+      SmallVector<BasicBlock *, 4> Preds;
+      for (auto *P : predecessors(J))
+        if (LI.getLoopFor(P) == L && DT.dominates(BasicBlockEdge(D, Succ), P))
+          Preds.push_back(P);
+      if (Preds.size() < 2 || Preds.size() == pred_size(J))
+        continue;
+      if (auto *New = SplitBlockPredecessors(J, Preds, ".join", &DT, &LI, nullptr, true)) {
+        Work.push_back(New);
+        ++Splits;
+      }
+    }
+  }
+  return Splits;
+}
+
 // W not a multiple of S: the last sub-group lacks lanes, which must not run. RV's region entry
 // mask is all lanes, so Lane's body (after the allocas) becomes `if (sg_first + lane < W)`, which
 // RV linearizes into a mask on every access, call and collective in it.
@@ -476,6 +520,7 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     FAM.invalidate(K, PreservedAnalyses::none());
     return Ok;
   };
+  const bool Pin = getEnvironmentVariableOrDefault<int>("VECTORIZE_PIN", 1); // P10, P10b
   if (!rewriteBuiltins(*Lane))
     return Finish(false);
   if (W % S)
@@ -484,6 +529,7 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
   // RV widens scalar types only and copies a vector-typed value (e.g. a sycl::float3) once per
   // lane: split them, with their loads and stores, into scalars, so each component becomes one
   // <S x T>. Then RV's preconditions: simplified loops, canonical loop exits, no critical edges.
+  unsigned Joins;
   {
     FunctionPassManager FPM;
     ScalarizerPassOptions ScalarizeAll;
@@ -497,6 +543,7 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     FAM.invalidate(*Lane, PreservedAnalyses::none());
     LoopExitCanonicalizer(FAM.getResult<LoopAnalysis>(*Lane)).canonicalize(*Lane);
     FAM.invalidate(*Lane, PreservedAnalyses::none());
+    Joins = Pin ? splitJoins(*Lane) : 0;
     FAM.getResult<LoopAnalysis>(*Lane); // RV reads it via getCachedResult
   }
   alignLaneCopies(*Lane);
@@ -504,13 +551,14 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     Why = "invalid per-lane function";
     return Finish(false);
   }
-  SmallVector<Instruction *, 16> Pinned; // ACPP_S2_VECTORIZE_PIN=0 disables it
-  if (getEnvironmentVariableOrDefault<int>("VECTORIZE_PIN", 1))
+  SmallVector<Instruction *, 16> Pinned; // ACPP_S2_VECTORIZE_PIN=0 disables it and splitJoins
+  if (Pin)
     Pinned = laneInvariantValues(*Lane);
 
   // RV, after the rv_* declarations exist (PlatformInfo registers them when created). All
   // arguments are uniform; sg_first is a multiple of S.
   bool Ok;
+  unsigned Branches = 0, UniformBranches = 0; // conditional, after RV's analysis
   {
     rv::PlatformInfo PI(M, nullptr, nullptr); // RV uses neither TTI nor TLI
     for (auto &Mapping : Mappings)
@@ -534,6 +582,11 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     Cfg.useAVX512 = Features.lookup("avx512f");
     rv::VectorizerInterface Vectorizer(PI, Cfg);
     Vectorizer.analyze(VecInfo, FAM);
+    for (auto &BB : *Lane)
+      if (auto *Br = dyn_cast<BranchInst>(BB.getTerminator()); Br && Br->isConditional()) {
+        ++Branches;
+        UniformBranches += VecInfo.getVectorShape(*Br).isUniform();
+      }
     Ok = Vectorizer.linearize(VecInfo, FAM) && Vectorizer.vectorize(VecInfo, FAM, nullptr) &&
          !verifyFunction(*V, &errs());
   }
@@ -543,7 +596,8 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
   }
 
   HIPSYCL_DEBUG_INFO << "[SubgroupVectorizer] " << K.getName() << ": " << Pinned.size()
-                     << " lane-invariant value(s) pinned uniform\n";
+                     << " lane-invariant value(s) pinned uniform, " << Joins << " join(s) split, "
+                     << UniformBranches << " of " << Branches << " branch(es) uniform\n";
   replaceBody(*V);
   return Finish(true);
 }
