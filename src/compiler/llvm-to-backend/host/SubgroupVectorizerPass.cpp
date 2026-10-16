@@ -25,7 +25,10 @@
 #include <rv/vectorizationInfo.h>
 
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Analysis/VectorUtils.h>
 #include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -82,6 +85,7 @@ private:
   SmallVector<Instruction *, 16> laneInvariantValues(Function &Lane);
   unsigned splitJoins(Function &Lane);
   unsigned lowerPrivateMemsets(Function &Lane);
+  std::array<unsigned, 4> windowAccesses(Function &V);
   void replaceBody(Function &V);
   void erase(Function *F, FunctionAnalysisManager &FAM) {
     FAM.clear(*F, F->getName());
@@ -277,96 +281,138 @@ void KernelVectorizer::alignLaneCopies(Function &Lane) {
   }
 }
 
+// The values of an integer expression of only sg_first, the lane id and constants in every
+// (sub-group k, lane l), at index k·S + l: W and S are known, sg_first = k·S. The lane id is
+// rv_lane_id in Lane; in RV's output, constant vectors and splats. Arguments, loads, phis and
+// other calls are not evaluated.
+class LaneValues {
+public:
+  struct Values {
+    SmallVector<APInt, 0> At; // per k·S + l
+    bool Lane;                // depends on the lane id
+  };
+  LaneValues(Value *SgFirst, unsigned S, uint64_t W)
+      : SgFirst{SgFirst}, S{S}, N{unsigned((W + S - 1) / S * S)} {}
+  unsigned size() const { return N; }
+  const Values *get(Value *X);
+
+private:
+  Value *SgFirst;
+  const unsigned S, N;
+  DenseMap<Value *, std::unique_ptr<Values>> Memo; // stable storage: callers keep pointers
+};
+
+const LaneValues::Values *LaneValues::get(Value *X) {
+  if (auto It = Memo.find(X); It != Memo.end())
+    return It->second.get();
+  Memo[X] = nullptr; // also breaks cycles
+  auto *VT = dyn_cast<FixedVectorType>(X->getType());
+  auto *T = dyn_cast<IntegerType>(X->getType()->getScalarType());
+  if (!T || T->getBitWidth() > 64 || (VT && VT->getNumElements() != S))
+    return nullptr;
+  const unsigned BW = T->getBitWidth();
+  Values R{{}, false};
+  auto *C = dyn_cast<CallInst>(X);
+  if (auto *Const = dyn_cast<Constant>(X)) { // scalar, or element l for lane l
+    for (unsigned J = 0; J < N; ++J) {
+      auto *E = VT ? Const->getAggregateElement(J % S) : Const;
+      if (isa_and_nonnull<UndefValue>(E)) // poison / undef: any value
+        R.At.push_back(APInt(BW, 0));
+      else if (auto *CI = dyn_cast_or_null<ConstantInt>(E))
+        R.At.push_back(CI->getValue());
+      else
+        return nullptr;
+    }
+    R.Lane = VT && !Const->getSplatValue();
+  } else if (X == SgFirst)
+    for (unsigned J = 0; J < N; ++J)
+      R.At.push_back(APInt(BW, J / S * S));
+  else if (C && C->getCalledFunction() && C->getCalledFunction()->getName() == "rv_lane_id") {
+    for (unsigned J = 0; J < N; ++J)
+      R.At.push_back(APInt(BW, J % S));
+    R.Lane = true;
+  } else if (auto *Sh = dyn_cast<ShuffleVectorInst>(X)) { // lane l = lane Mask[l] of a ++ b
+    auto *A = get(Sh->getOperand(0)), *B = get(Sh->getOperand(1));
+    if (!A || !B)
+      return nullptr;
+    for (unsigned J = 0; J < N; ++J) {
+      const int M = Sh->getMaskValue(J % S);
+      R.At.push_back(M < 0 ? APInt(BW, 0) : (M < int(S) ? A : B)->At[J / S * S + M % S]);
+    }
+    R.Lane = A->Lane || B->Lane;
+  } else if (auto *IE = dyn_cast<InsertElementInst>(X)) {
+    auto *A = get(IE->getOperand(0)), *E = get(IE->getOperand(1));
+    auto *Idx = dyn_cast<ConstantInt>(IE->getOperand(2));
+    if (!A || !E || !Idx)
+      return nullptr;
+    for (unsigned J = 0; J < N; ++J)
+      R.At.push_back(J % S == Idx->getZExtValue() ? E->At[J] : A->At[J]);
+    R.Lane = A->Lane || E->Lane;
+  } else if (auto *I = dyn_cast<Instruction>(X)) {
+    SmallVector<const Values *, 3> Ops;
+    for (Value *O : I->operands()) {
+      auto *E = get(O);
+      if (!E)
+        return nullptr;
+      Ops.push_back(E);
+      R.Lane |= E->Lane;
+    }
+    for (unsigned J = 0; J < N; ++J) {
+      auto A = [&](unsigned K) -> const APInt & { return Ops[K]->At[J]; };
+      std::optional<APInt> V;
+      if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+        const bool Div = BO->isIntDivRem(), Shift = BO->isShift();
+        if ((Div && A(1).isZero()) || (Shift && A(1).uge(BW)))
+          return nullptr;
+        switch (BO->getOpcode()) {
+        case Instruction::Add: V = A(0) + A(1); break;
+        case Instruction::Sub: V = A(0) - A(1); break;
+        case Instruction::Mul: V = A(0) * A(1); break;
+        case Instruction::UDiv: V = A(0).udiv(A(1)); break;
+        case Instruction::SDiv: V = A(0).sdiv(A(1)); break;
+        case Instruction::URem: V = A(0).urem(A(1)); break;
+        case Instruction::SRem: V = A(0).srem(A(1)); break;
+        case Instruction::Shl: V = A(0).shl(A(1)); break;
+        case Instruction::LShr: V = A(0).lshr(A(1)); break;
+        case Instruction::AShr: V = A(0).ashr(A(1)); break;
+        case Instruction::And: V = A(0) & A(1); break;
+        case Instruction::Or: V = A(0) | A(1); break;
+        case Instruction::Xor: V = A(0) ^ A(1); break;
+        default: return nullptr;
+        }
+      } else if (auto *Cast = dyn_cast<CastInst>(I)) {
+        if (Cast->getOpcode() == Instruction::ZExt) V = A(0).zext(BW);
+        else if (Cast->getOpcode() == Instruction::SExt) V = A(0).sext(BW);
+        else if (Cast->getOpcode() == Instruction::Trunc) V = A(0).trunc(BW);
+        else return nullptr;
+      } else if (auto *Cmp = dyn_cast<ICmpInst>(I))
+        V = APInt(1, ICmpInst::compare(A(0), A(1), Cmp->getPredicate()));
+      else if (isa<SelectInst>(I))
+        V = A(0).getBoolValue() ? A(1) : A(2);
+      else
+        return nullptr;
+      R.At.push_back(*V);
+    }
+  } else
+    return nullptr;
+  return (Memo[X] = std::make_unique<Values>(std::move(R))).get();
+}
+
 // values that depend on the lane but are equal in all lanes of every sub-group, e.g.
 // GROMACS's `tidx / 8` at S = 8 in 4x4 work-groups: RV has no periodic shape (lid.x = lane % 4)
-// and calls them varying. W and S are known, so an expression of only sg_first, rv_lane_id and
-// constants is evaluated for every (sub-group k: sg_first = k·S, lane); equal in all S lanes of
-// every sub-group (missing lanes of a partial one included, so the missing-lane guard never
-// qualifies) means uniform. Pinned uniform, RV keeps branches on them and computes them once, from
-// lane 0 of their operands.
+// and calls them varying. Their values in every (sub-group, lane) (LaneValues) equal in all S
+// lanes of every sub-group (missing lanes of a partial one included, so the missing-lane guard
+// never qualifies) means uniform. Pinned uniform, RV keeps branches on them and computes them
+// once, from lane 0 of their operands.
 SmallVector<Instruction *, 16> KernelVectorizer::laneInvariantValues(Function &Lane) {
-  const unsigned N = (W + S - 1) / S * S; // index k·S + lane
-  struct Values {
-    SmallVector<APInt, 0> At; // per (sub-group, lane)
-    bool Lane;                // depends on rv_lane_id
-  };
-  DenseMap<Value *, std::unique_ptr<Values>> Memo; // stable storage: Ops outlives insertions
-  Value *SgFirst = Lane.getArg(K.arg_size());
-  std::function<const Values *(Value *)> Eval = [&](Value *X) -> const Values * {
-    if (auto It = Memo.find(X); It != Memo.end())
-      return It->second.get();
-    Memo[X] = nullptr; // also breaks cycles
-    auto *T = dyn_cast<IntegerType>(X->getType());
-    if (!T || T->getBitWidth() > 64)
-      return nullptr;
-    const unsigned BW = T->getBitWidth();
-    Values R{{}, false};
-    auto *C = dyn_cast<CallInst>(X);
-    if (auto *CI = dyn_cast<ConstantInt>(X))
-      R.At.assign(N, CI->getValue());
-    else if (X == SgFirst)
-      for (unsigned I = 0; I < N; ++I)
-        R.At.push_back(APInt(BW, I / S * S));
-    else if (C && C->getCalledFunction() && C->getCalledFunction()->getName() == "rv_lane_id") {
-      for (unsigned I = 0; I < N; ++I)
-        R.At.push_back(APInt(BW, I % S));
-      R.Lane = true;
-    } else if (auto *I = dyn_cast<Instruction>(X)) {
-      SmallVector<const Values *, 3> Ops;
-      for (Value *O : I->operands()) {
-        auto *E = Eval(O);
-        if (!E)
-          return nullptr;
-        Ops.push_back(E);
-        R.Lane |= E->Lane;
-      }
-      for (unsigned J = 0; J < N; ++J) {
-        auto A = [&](unsigned K) -> const APInt & { return Ops[K]->At[J]; };
-        std::optional<APInt> V;
-        if (auto *BO = dyn_cast<BinaryOperator>(I)) {
-          const bool Div = BO->isIntDivRem(), Shift = BO->isShift();
-          if ((Div && A(1).isZero()) || (Shift && A(1).uge(BW)))
-            return nullptr;
-          switch (BO->getOpcode()) {
-          case Instruction::Add: V = A(0) + A(1); break;
-          case Instruction::Sub: V = A(0) - A(1); break;
-          case Instruction::Mul: V = A(0) * A(1); break;
-          case Instruction::UDiv: V = A(0).udiv(A(1)); break;
-          case Instruction::SDiv: V = A(0).sdiv(A(1)); break;
-          case Instruction::URem: V = A(0).urem(A(1)); break;
-          case Instruction::SRem: V = A(0).srem(A(1)); break;
-          case Instruction::Shl: V = A(0).shl(A(1)); break;
-          case Instruction::LShr: V = A(0).lshr(A(1)); break;
-          case Instruction::AShr: V = A(0).ashr(A(1)); break;
-          case Instruction::And: V = A(0) & A(1); break;
-          case Instruction::Or: V = A(0) | A(1); break;
-          case Instruction::Xor: V = A(0) ^ A(1); break;
-          default: return nullptr;
-          }
-        } else if (auto *Cast = dyn_cast<CastInst>(I)) {
-          if (Cast->getOpcode() == Instruction::ZExt) V = A(0).zext(BW);
-          else if (Cast->getOpcode() == Instruction::SExt) V = A(0).sext(BW);
-          else if (Cast->getOpcode() == Instruction::Trunc) V = A(0).trunc(BW);
-          else return nullptr;
-        } else if (auto *Cmp = dyn_cast<ICmpInst>(I))
-          V = APInt(1, ICmpInst::compare(A(0), A(1), Cmp->getPredicate()));
-        else if (isa<SelectInst>(I))
-          V = A(0).getBoolValue() ? A(1) : A(2);
-        else
-          return nullptr;
-        R.At.push_back(*V);
-      }
-    } else
-      return nullptr; // other arguments, loads, phis, calls: not evaluated
-    return (Memo[X] = std::make_unique<Values>(std::move(R))).get();
-  };
+  LaneValues Values(Lane.getArg(K.arg_size()), S, W);
   SmallVector<Instruction *, 16> Invariant;
   for (auto &I : instructions(Lane)) {
-    auto *E = Eval(&I);
+    auto *E = Values.get(&I);
     if (!E || !E->Lane)
       continue;
     bool Same = true;
-    for (unsigned J = 0; J < N && Same; ++J)
+    for (unsigned J = 0; J < Values.size() && Same; ++J)
       Same = E->At[J] == E->At[J / S * S];
     if (Same)
       Invariant.push_back(&I);
@@ -480,6 +526,271 @@ unsigned KernelVectorizer::lowerPrivateMemsets(Function &Lane) {
     ++Lowered;
   }
   return Lowered;
+}
+
+// Periodic and contiguous accesses. Each lane reads element i*4 + lid.x of GROMACS's xqib, an
+// array of float4 {x, y, z, q}. At S = 8 in 4x4 work-groups lid.x = <0,1,2,3,0,1,2,3>, which RV
+// calls varying, so it emits one gather per field:
+//   x = gather(&x8, &x9, &x10, &x11, &x8, &x9, &x10, &x11),  y = gather(&y8, ...),  z, q likewise
+// The lanes' addresses differ from lane 0's by known constants within a small range, so one load
+// of that range, shuffled into one vector per field, replaces the 4 gathers:
+//   memory  x8 y8 z8 q8 | x9 y9 z9 q9 | x10 y10 z10 q10 | x11 y11 z11 q11   (floats 0..15)
+//   W = load 16 floats at &x8
+//   x = shuffle(W, <0,4,8,12,0,4,8,12>),  y = shuffle(W, <1,5,9,13,...>),  z, q likewise
+// The window holds at most 2S elements. Gathers share one if they have the same base and mask, in
+// one block with no write between them; under a mask it loads only the elements active lanes read.
+// A scatter writing distinct elements becomes a shuffle and one masked store.
+std::array<unsigned, 4> KernelVectorizer::windowAccesses(Function &V) {
+  const auto &DL = M.getDataLayout();
+  LaneValues Values(V.getArg(K.arg_size()), S, W);
+  // lane l's value minus lane 0's, the same in every sub-group; ExactU / ExactS: D as a signed
+  // number is the exact difference of the values read as unsigned / signed (for zext / sext)
+  struct LaneDiffs {
+    SmallVector<APInt, 16> D;
+    bool ExactU, ExactS;
+  };
+  DenseMap<Value *, std::optional<LaneDiffs>> Memo;
+  std::function<std::optional<LaneDiffs>(Value *)> Diffs = [&](Value *X) -> std::optional<LaneDiffs> {
+    if (auto It = Memo.find(X); It != Memo.end())
+      return It->second;
+    Memo[X] = std::nullopt;
+    auto *VT = dyn_cast<FixedVectorType>(X->getType());
+    auto *IT = dyn_cast<IntegerType>(X->getType()->getScalarType());
+    if (!VT || !IT || VT->getNumElements() != S || IT->getBitWidth() > 64)
+      return std::nullopt;
+    const unsigned BW = IT->getBitWidth();
+    auto Wide = [&](const APInt &A, bool Signed) { return Signed ? A.sext(BW + 1) : A.zext(BW + 1); };
+    std::optional<LaneDiffs> R;
+    if (getSplatValue(X)) // uniform
+      R = LaneDiffs{SmallVector<APInt, 16>(S, APInt(BW, 0)), true, true};
+    else if (auto *E = Values.get(X)) { // of sg_first, lane ids and constants: evaluated
+      R = LaneDiffs{{}, true, true};
+      for (unsigned J = 0; J < Values.size(); ++J) {
+        const APInt &A = E->At[J], &A0 = E->At[J / S * S], D = A - A0;
+        if (J < S)
+          R->D.push_back(D);
+        else if (D != R->D[J % S])
+          return std::nullopt;
+        R->ExactU &= Wide(A, false) - Wide(A0, false) == D.sext(BW + 1);
+        R->ExactS &= Wide(A, true) - Wide(A0, true) == D.sext(BW + 1);
+      }
+    } else if (auto *I = dyn_cast<Instruction>(X)) {
+      const unsigned Op = I->getOpcode();
+      auto A = I->getNumOperands() ? Diffs(I->getOperand(0)) : std::nullopt;
+      auto *C = I->getNumOperands() > 1 ? dyn_cast_or_null<ConstantInt>(getSplatValue(I->getOperand(1)))
+                                        : nullptr;
+      if (!A)
+        ;
+      else if (Op == Instruction::Add || Op == Instruction::Sub ||
+               (Op == Instruction::Or && cast<PossiblyDisjointInst>(I)->isDisjoint())) {
+        auto B = Diffs(I->getOperand(1)); // or disjoint: an add without carries
+        const bool Or = Op == Instruction::Or;
+        if (B) {
+          R = LaneDiffs{{}, A->ExactU && B->ExactU && (Or || I->hasNoUnsignedWrap()),
+                        A->ExactS && B->ExactS && (Or || I->hasNoSignedWrap())};
+          for (unsigned L = 0; L < S; ++L) {
+            bool Ov;
+            R->D.push_back(Op == Instruction::Sub ? A->D[L].ssub_ov(B->D[L], Ov) : A->D[L].sadd_ov(B->D[L], Ov));
+            R->ExactU &= !Ov;
+            R->ExactS &= !Ov;
+          }
+        }
+      } else if ((Op == Instruction::Shl && C && C->getValue().ult(BW)) || (Op == Instruction::Mul && C)) {
+        R = LaneDiffs{{}, A->ExactU && I->hasNoUnsignedWrap(), A->ExactS && I->hasNoSignedWrap()};
+        for (unsigned L = 0; L < S; ++L) {
+          bool Ov;
+          R->D.push_back(Op == Instruction::Shl ? A->D[L].sshl_ov(C->getValue(), Ov)
+                                                : A->D[L].smul_ov(C->getValue(), Ov));
+          R->ExactU &= !Ov;
+          R->ExactS &= !Ov;
+        }
+      } else if (Op == Instruction::ZExt && (A->ExactU || (I->hasNonNeg() && A->ExactS))) {
+        R = LaneDiffs{{}, true, true}; // non-negative in the wider type
+        for (auto &D : A->D)
+          R->D.push_back(D.sext(BW));
+      } else if (Op == Instruction::SExt && A->ExactS) {
+        R = LaneDiffs{{}, false, true};
+        for (auto &D : A->D)
+          R->D.push_back(D.sext(BW));
+      } else if (Op == Instruction::Trunc) {
+        R = LaneDiffs{{}, A->ExactU && I->hasNoUnsignedWrap(), A->ExactS && I->hasNoSignedWrap()};
+        for (auto &D : A->D) {
+          R->D.push_back(D.trunc(BW));
+          R->ExactU &= R->D.back().sext(D.getBitWidth()) == D;
+          R->ExactS &= R->D.back().sext(D.getBitWidth()) == D;
+        }
+      }
+    }
+    return Memo[X] = R;
+  };
+
+  // a gather / scatter: lane l's address = Root + Σ Key (index · stride) + Const + B[l], B[0] = 0
+  struct Access {
+    IntrinsicInst *Call;
+    bool Gather;
+    Value *Ptr, *Mask, *Root = nullptr;
+    Type *T;
+    Align A;
+    SmallVector<std::pair<Value *, int64_t>, 4> Key; // non-constant indices, strides
+    int64_t Const = 0;
+    SmallVector<int64_t, 16> B;
+  };
+  std::function<bool(Value *, Access &)> Walk = [&](Value *P, Access &A) {
+    if (Value *Sp = P->getType()->isVectorTy() ? getSplatValue(P) : P) {
+      A.Root = Sp;
+      return true;
+    }
+    auto *G = dyn_cast<GEPOperator>(P);
+    if (!G || !Walk(G->getPointerOperand(), A))
+      return false;
+    for (auto GTI = gep_type_begin(G), E = gep_type_end(G); GTI != E; ++GTI) {
+      Value *Idx = GTI.getOperand(), *Uni = Idx->getType()->isVectorTy() ? getSplatValue(Idx) : Idx;
+      auto *CI = dyn_cast_or_null<ConstantInt>(Uni);
+      if (GTI.isStruct()) {
+        if (!CI)
+          return false;
+        A.Const += DL.getStructLayout(GTI.getStructType())->getElementOffset(CI->getZExtValue());
+        continue;
+      }
+      const int64_t Stride = GTI.getSequentialElementStride(DL).getFixedValue();
+      if (CI)
+        A.Const += CI->getSExtValue() * Stride;
+      else
+        A.Key.emplace_back(Idx, Stride); // uniform, or lane 0's value of Idx
+      if (Uni)
+        continue;
+      auto D = Diffs(Idx); // indices narrower than the pointer are sign-extended
+      if (!D || (Idx->getType()->getScalarSizeInBits() < 64 && !D->ExactS))
+        return false;
+      for (unsigned L = 0; L < S; ++L)
+        A.B[L] = int64_t(uint64_t(A.B[L]) + uint64_t(D->D[L].getSExtValue()) * uint64_t(Stride));
+    }
+    return true;
+  };
+  auto Analyze = [&](IntrinsicInst *C) -> std::optional<Access> {
+    const bool Gather = C->getIntrinsicID() == Intrinsic::masked_gather;
+    Access A{C, Gather, C->getArgOperand(Gather ? 0 : 1), C->getArgOperand(Gather ? 2 : 3)};
+    A.T = cast<VectorType>((Gather ? C : C->getArgOperand(0))->getType())->getElementType();
+    A.A = cast<ConstantInt>(C->getArgOperand(Gather ? 1 : 2))->getAlignValue();
+    A.B.assign(S, 0);
+    if (DL.getTypeStoreSize(A.T) != DL.getTypeAllocSize(A.T) || !Walk(A.Ptr, A) ||
+        isa<AllocaInst>(getUnderlyingObject(A.Root)))
+      return std::nullopt;
+    return A;
+  };
+
+  // element j of a window is read / written by lanes Lanes[j]: mask lane-wise or of them
+  auto WindowMask = [&](IRBuilder<> &B, Value *Mask, ArrayRef<SmallVector<int, 4>> Lanes) -> Value * {
+    auto *C = dyn_cast<Constant>(Mask);
+    if (C && C->isAllOnesValue()) {
+      SmallVector<Constant *, 32> E;
+      for (auto &L : Lanes)
+        E.push_back(B.getInt1(!L.empty()));
+      return ConstantVector::get(E);
+    }
+    Value *R = nullptr;
+    for (size_t Round = 0;; ++Round) {
+      SmallVector<int, 32> Sel;
+      bool Any = false;
+      for (auto &L : Lanes) {
+        Any |= Round < L.size();
+        Sel.push_back(Round < L.size() ? L[Round] : int(S)); // S: a false lane
+      }
+      if (!Any)
+        return R;
+      Value *M = B.CreateShuffleVector(Mask, Constant::getNullValue(Mask->getType()), Sel);
+      R = R ? B.CreateOr(R, M) : M;
+    }
+  };
+  std::array<unsigned, 4> Count{};
+  auto Emit = [&](SmallVector<Access, 4> &G) {
+    const int64_t E = DL.getTypeStoreSize(G[0].T);
+    int64_t Lo = INT64_MAX, Hi = INT64_MIN;
+    for (auto &A : G)
+      for (int64_t Off : A.B) {
+        Lo = std::min(Lo, A.Const + Off);
+        Hi = std::max(Hi, A.Const + Off + E);
+      }
+    const int64_t N = (Hi - Lo) / E, NV = N <= int64_t(S) ? S : 2 * S;
+    auto Elem = [&](const Access &A, unsigned L) { return (A.Const + A.B[L] - Lo) / E; };
+    if (N > 2 * int64_t(S) || any_of(G, [&](const Access &A) {
+          return any_of(A.B, [&](int64_t Off) { return (A.Const + Off - Lo) % E != 0; });
+        }))
+      return;
+    SmallVector<SmallVector<int, 4>, 32> Lanes(NV);
+    for (auto &A : G)
+      for (unsigned L = 0; L < S; ++L)
+        if (!is_contained(Lanes[Elem(A, L)], int(L)))
+          Lanes[Elem(A, L)].push_back(L);
+    if (!G[0].Gather && any_of(Lanes, [](auto &L) { return L.size() > 1; }))
+      return; // a scatter writing one element from two lanes
+    IRBuilder<> B(G[0].Call);
+    auto *VT = FixedVectorType::get(G[0].T, NV);
+    Value *Start = B.CreateGEP(B.getInt8Ty(), B.CreateExtractElement(G[0].Ptr, uint64_t(0)),
+                               B.getInt64(Lo - G[0].Const));
+    Align Al = G[0].A;
+    for (auto &A : G)
+      Al = std::min(Al, A.A);
+    Value *Mask = WindowMask(B, G[0].Mask, Lanes);
+    auto *MC = dyn_cast<Constant>(Mask);
+    const bool Full = MC && MC->isAllOnesValue(); // every element, all lanes on
+    if (G[0].Gather) {
+      Value *Window = Full ? static_cast<Value *>(B.CreateAlignedLoad(VT, Start, Al))
+                           : B.CreateMaskedLoad(VT, Start, Al, Mask);
+      for (auto &A : G) {
+        IRBuilder<> BA(A.Call); // at the gather: its passthru may be defined after G[0]
+        SmallVector<int, 16> Sel;
+        for (unsigned L = 0; L < S; ++L)
+          Sel.push_back(Elem(A, L));
+        Value *X = BA.CreateShuffleVector(Window, Sel);
+        auto *AllOn = dyn_cast<Constant>(A.Mask);
+        if (!isa<UndefValue>(A.Call->getArgOperand(3)) && !(AllOn && AllOn->isAllOnesValue()))
+          X = BA.CreateSelect(A.Mask, X, A.Call->getArgOperand(3));
+        A.Call->replaceAllUsesWith(X);
+        A.Call->eraseFromParent();
+      }
+      Count[0] += G.size();
+    } else {
+      SmallVector<int, 32> Sel;
+      for (auto &L : Lanes)
+        Sel.push_back(L.empty() ? -1 : L[0]);
+      Value *X = B.CreateShuffleVector(G[0].Call->getArgOperand(0), Sel);
+      if (Full)
+        B.CreateAlignedStore(X, Start, Al);
+      else
+        B.CreateMaskedStore(X, Start, Al, Mask);
+      G[0].Call->eraseFromParent();
+      Count[2] += 1;
+    }
+  };
+
+  SmallVector<SmallVector<Access, 4>, 16> Groups;
+  for (auto &BB : V) {
+    size_t Open = Groups.size(); // gather groups from here on may still take a gather
+    for (auto &I : BB) {
+      auto *C = dyn_cast<IntrinsicInst>(&I);
+      const bool Gather = C && C->getIntrinsicID() == Intrinsic::masked_gather;
+      const bool Scatter = C && C->getIntrinsicID() == Intrinsic::masked_scatter;
+      Count[1] += Gather;
+      Count[3] += Scatter;
+      if (I.mayWriteToMemory())
+        Open = Groups.size(); // no window load across a write
+      auto A = Gather || Scatter ? Analyze(C) : std::nullopt;
+      if (!A)
+        continue;
+      auto *G = Gather ? find_if(drop_begin(Groups, Open), [&](auto &G) {
+        return G[0].Gather && G[0].Root == A->Root && G[0].Key == A->Key && G[0].Mask == A->Mask &&
+               G[0].T == A->T;
+      }) : Groups.end();
+      if (G != Groups.end())
+        G->push_back(std::move(*A));
+      else
+        Groups.push_back({std::move(*A)}); // a scatter alone: it closed the open groups above
+    }
+  }
+  for (auto &G : Groups)
+    Emit(G);
+  return Count;
 }
 
 // W not a multiple of S: the last sub-group lacks lanes, which must not run. RV's region entry
@@ -665,6 +976,15 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     return Finish(false);
   }
 
+  // ACPP_S2_VECTORIZE_WINDOWS=0 keeps periodic gathers / scatters (A/B profiling)
+  std::array<unsigned, 4> Windows{};
+  if (getEnvironmentVariableOrDefault<int>("VECTORIZE_WINDOWS", 1)) {
+    Windows = windowAccesses(*V);
+    if (verifyFunction(*V, &errs())) {
+      Why = "invalid window accesses";
+      return Finish(false);
+    }
+  }
   unsigned ElementMajor = 0; // private arrays RV's StructOpt laid out [N x <S x T>]
   for (auto &I : instructions(*V))
     if (auto *A = dyn_cast<AllocaInst>(&I))
@@ -673,7 +993,9 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
   HIPSYCL_DEBUG_INFO << "[SubgroupVectorizer] " << K.getName() << ": " << Pinned.size()
                      << " lane-invariant value(s) pinned uniform, " << Joins << " join(s) split, "
                      << UniformBranches << " of " << Branches << " branch(es) uniform, " << Memsets
-                     << " memset(s) lowered, " << ElementMajor << " private array(s) element-major\n";
+                     << " memset(s) lowered, " << ElementMajor << " private array(s) element-major, "
+                     << Windows[0] << " of " << Windows[1] << " gather(s) and " << Windows[2] << " of "
+                     << Windows[3] << " scatter(s) as windows\n";
   replaceBody(*V);
   return Finish(true);
 }

@@ -359,6 +359,40 @@ void vec_pinned_update(sycl::queue &q, In in) {
   });
 }
 
+// periodic and contiguous lanes through lid.x / lid.y (4 x 4 work-groups, S = 8: lid.x =
+// <0,1,2,3,0,1,2,3>, lid.y two values): the float2 fields of 4 neighbouring elements share one
+// window load, a masked read of 2 elements, a contiguous store to local memory and its reversed
+// read become window loads / stores instead of gathers / scatters
+// RV: [SubgroupVectorizer] {{.*}}vec_periodicRN{{.*}}: {{.*}} {{[1-9][0-9]*}} of {{[0-9]+}} gather(s) and {{[1-9][0-9]*}} of {{[0-9]+}} scatter(s) as windows
+// RV: [SubgroupVectorizer] {{.*}}vec_periodicRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group
+// OK: vec_periodic: ok
+void vec_periodic(sycl::queue &q, In in) {
+  auto R = [=](size_t g, size_t t) { // item t (= ly·4 + lx) of work-group g
+    const size_t lx = t % 4, ly = t / 4, i = (g / 2 * 4 + ly) * 8 + g % 2 * 4 + lx;
+    float r = in.xy[g * 4 + lx].x() + 2.f * in.xy[g * 4 + lx].y();
+    if (in.x[i] > 6.f)
+      r += in.y[g * 4 + ly];
+    return r;
+  };
+  check(q, "vec_periodic", [=](sycl::handler &h, float *o) {
+    sycl::local_accessor<float, 1> Tmp{16, h};
+    h.parallel_for(sycl::nd_range<2>{{8, 8}, {4, 4}}, [=](sycl::nd_item<2> it) {
+      const size_t i = it.get_global_linear_id(), g = it.get_group_linear_id();
+      const size_t lx = it.get_local_id(1), ly = it.get_local_id(0);
+      const sycl::float2 a = in.xy[g * 4 + lx];
+      float r = a.x() + 2.f * a.y();
+      if (in.x[i] > 6.f)
+        r += in.y[g * 4 + ly];
+      Tmp[ly * 4 + lx] = r;
+      sycl::group_barrier(it.get_group());
+      o[i] = r + 0.5f * Tmp[15 - (ly * 4 + lx)];
+    });
+  }, [=](size_t i, size_t) -> Opt {
+    const size_t r0 = i / 8, c0 = i % 8, g = r0 / 4 * 2 + c0 / 4, t = r0 % 4 * 4 + c0 % 4;
+    return R(g, t) + 0.5f * R(g, 15 - t);
+  });
+}
+
 // work-groups of 12: at S = 8 sub-groups of 8 and 4 lanes; the missing lanes are masked off
 // RV: [SubgroupVectorizer] {{.*}}vec_partialRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group (the last partial)
 // OK: vec_partial: ok
@@ -469,6 +503,7 @@ int main(int argc, char **) {
   vec_reverse(q, in);
   vec_pinned(q, in);
   vec_pinned_update(q, in);
+  vec_periodic(q, in);
   vec_partial(q, in);
   vec_partial_barrier(q, in);
   vec_partial_2d(q, in);
