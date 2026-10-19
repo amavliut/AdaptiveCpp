@@ -11,7 +11,6 @@
 #include "hipSYCL/compiler/cbs/LoopSplitterInlining.hpp"
 #include "hipSYCL/compiler/cbs/IRUtils.hpp"
 #include "hipSYCL/compiler/cbs/SplitterAnnotationAnalysis.hpp"
-#include "hipSYCL/compiler/cbs/SubgroupSteps.hpp"
 #include "hipSYCL/compiler/utils/LLVMUtils.hpp"
 
 #include "hipSYCL/common/debug.hpp"
@@ -115,9 +114,7 @@ bool fillTransitiveSplitterCallers(llvm::Function &F,
   } else if (FuncsWSplitter.find(&F) != FuncsWSplitter.end())
     return true;
 
-  // kept sub-group collectives are never defined (SubgroupSteps.hpp)
-  if (F.isDeclaration() && !F.isIntrinsic() && !InIntrinsic &&
-      !F.getName().starts_with(hipsycl::compiler::KeptCollectivePrefix)) {
+  if (F.isDeclaration() && !F.isIntrinsic() && !InIntrinsic) {
     HIPSYCL_DEBUG_WARNING << "[LoopSplitterInlining] " << F.getName() << " is not defined!\n";
   }
 

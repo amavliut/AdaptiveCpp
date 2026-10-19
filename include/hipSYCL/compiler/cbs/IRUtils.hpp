@@ -31,8 +31,6 @@ struct MDKind {
   static constexpr const char InnerLoop[] = "hipSYCL.loop.inner";
   static constexpr const char WorkItemLoop[] = "hipSYCL.loop.workitem";
   static constexpr const char LoopState[] = "hipSYCL.loop_state";
-  // arrayified, but one slot per lane of a sub-group (SubgroupSteps), not per work-item
-  static constexpr const char SubgroupShared[] = "hipSYCL.sg_shared";
 };
 
 namespace cbs {

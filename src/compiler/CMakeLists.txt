@@ -225,7 +225,6 @@ if(WITH_ACCELERATED_CPU OR WITH_SSCP_COMPILER)
     cbs/PipelineBuilder.cpp
     cbs/SubCfgFormation.cpp
     cbs/SubgroupOps.cpp
-    cbs/SubgroupSteps.cpp
     cbs/UniformityAnalysis.cpp
     cbs/VectorShape.cpp
     cbs/VectorizationInfo.cpp

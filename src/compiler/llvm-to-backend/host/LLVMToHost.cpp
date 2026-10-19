@@ -16,7 +16,6 @@
 #include "hipSYCL/compiler/cbs/IRUtils.hpp"
 #include "hipSYCL/compiler/cbs/PipelineBuilder.hpp"
 #include "hipSYCL/compiler/cbs/SplitterAnnotationAnalysis.hpp"
-#include "hipSYCL/compiler/cbs/SubgroupSteps.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceMap.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/host/MaskDivergentSubgroupCollectivesPass.hpp"
@@ -175,13 +174,8 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
     SubgroupVectorizerPass{getSubgroupSize(), {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ},
                            KernelNames}.run(M, *PH.ModuleAnalysisManager);
 #endif
-  if (getSubgroupSize() > 1) {
+  if (getSubgroupSize() > 1)
     MaskDivergentSubgroupCollectivesPass{}.run(M, *PH.ModuleAnalysisManager);
-    // collectives stay calls until CBS runs each as one vector step per sub-group
-    // (SubgroupSteps.hpp); ACPP_S2_SUBGROUP_STEPS=0 keeps the per-lane builtins
-    if (getEnvironmentVariableOrDefault<int>("SUBGROUP_STEPS", 1))
-      keepSubgroupCollectives(M, KernelNames);
-  }
 
   std::string BuiltinBitcodeFileName = "libkernel-sscp-host-full.bc";
   if(IsFastMath)

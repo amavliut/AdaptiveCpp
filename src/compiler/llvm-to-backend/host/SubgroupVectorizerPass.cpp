@@ -94,7 +94,7 @@ private:
 };
 
 // A sub-group collective C as a call of `T acpp_rv_sg.<builtin>[.<op> | .c<constant>](per-lane args)`,
-// which RV maps to a masked vector function built with V1's operations (SubgroupOps.hpp): for
+// which RV maps to a masked vector function built with SubgroupOps.hpp: for
 // reduce and scans inactive lanes contribute the identity, then the builtins' tree order (results
 // as on the scalar path); a constant shuffle operand is part of the function, so it is one
 // shufflevector. RV maps every resolved call result as a vector, so reduce returns a splat.

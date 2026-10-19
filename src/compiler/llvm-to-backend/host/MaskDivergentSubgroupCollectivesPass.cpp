@@ -18,17 +18,11 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/PostDominators.h>
-#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
-#include <llvm/Transforms/InstCombine/InstCombine.h>
-#include <llvm/Transforms/Scalar/EarlyCSE.h>
-#include <llvm/Transforms/Scalar/SROA.h>
-#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/SSAUpdater.h>
 
 namespace hipsycl::compiler {
@@ -115,10 +109,9 @@ public:
   //                                                J: C(c ? x : identity); br c, post, K
   // J is the new block holding C, reached from the end of `pre` and, through G's skip edge, by
   // the lanes that skip the `if`; after C every lane goes where it was going (`post` or K).
-  // C takes along the collectives right after it (only pure code between them), so they stay one
-  // sub-group step. The skipping lanes don't have the values of S … pre: they get zero there (the
-  // identity for reductions, scans and votes), and use none of the results. Invalidates the
-  // analyses: false if C has no controlling branch or can't be handled.
+  // The skipping lanes don't have the values of S … pre: they get zero there (the identity for
+  // reductions, scans and votes), and use none of the results. Invalidates the analyses: false
+  // if C has no controlling branch or can't be handled.
   bool maskOnce(llvm::CallInst &C) {
     llvm::BasicBlock *S = nullptr;
     auto *Br = controllingBranch(C, S);
@@ -128,12 +121,6 @@ public:
       return false;
     if (!getMask(C, ArgNo, Identity))
       return keep(C, "no identity element for this operation");
-    llvm::SmallVector<llvm::CallInst *, 4> Run{&C};
-    for (auto *I = C.getNextNode(); !I->isTerminator(); I = I->getNextNode())
-      if (auto *Call = asCollective(I); Call && getMask(*Call, ArgNo, Identity))
-        Run.push_back(Call);
-      else if (Call || I->mayReadOrWriteMemory() || !llvm::isSafeToSpeculativelyExecute(I))
-        break;
     auto *G = Br->getParent();
     auto *B = C.getParent();
     const unsigned Skip = Br->getSuccessor(0) == S;
@@ -142,15 +129,12 @@ public:
     DT.getDescendants(S, Region);
 
     auto *J = B->splitBasicBlock(&C, B->getName() + ".masked");
-    auto *Post = J->splitBasicBlock(Run.back()->getNextNode(), B->getName() + ".post");
+    auto *Post = J->splitBasicBlock(C.getNextNode(), B->getName() + ".post");
     J->getTerminator()->eraseFromParent();
     llvm::IRBuilder<> Builder{&C};
     llvm::Value *Taken = Skip ? Br->getCondition() : Builder.CreateNot(Br->getCondition());
-    for (auto *Call : Run)
-      if (getMask(*Call, ArgNo, Identity); Identity) {
-        Builder.SetInsertPoint(Call);
-        Call->setArgOperand(ArgNo, Builder.CreateSelect(Taken, Call->getArgOperand(ArgNo), Identity));
-      }
+    if (Identity)
+      C.setArgOperand(ArgNo, Builder.CreateSelect(Taken, C.getArgOperand(ArgNo), Identity));
     Builder.SetInsertPoint(J);
     Builder.CreateCondBr(Taken, Post, K);
     K->replacePhiUsesWith(G, J);
@@ -172,8 +156,8 @@ public:
         for (auto *U : Uses)
           SSA.RewriteUse(*U);
       }
-    HIPSYCL_DEBUG_INFO << "[MaskDivergentSubgroupCollectives] masked " << Run.size()
-                       << " collective(s) from " << C << " at " << G->getName() << "\n";
+    HIPSYCL_DEBUG_INFO << "[MaskDivergentSubgroupCollectives] masked " << C << " at "
+                       << G->getName() << "\n";
     return true;
   }
 };
@@ -185,29 +169,21 @@ llvm::PreservedAnalyses MaskDivergentSubgroupCollectivesPass::run(llvm::Module &
   auto &FAM = AM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
   bool Changed = false;
   for (auto &F : M) {
-    if (F.isDeclaration() ||
-        llvm::none_of(llvm::instructions(F), [](auto &I) { return asCollective(&I); }))
+    if (F.isDeclaration())
       continue;
-    // to SSA first, as the vectorizer does: here the code between two collectives still goes
-    // through private memory, which lanes skipping them must not write
-    llvm::FunctionPassManager FPM;
-    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-    FPM.addPass(llvm::EarlyCSEPass());
-    FPM.addPass(llvm::InstCombinePass(llvm::InstCombineOptions().setVerifyFixpoint(false)));
-    FPM.addPass(llvm::SimplifyCFGPass());
-    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-    FPM.run(F, FAM);
-    Changed = true;
     // in program order, so a collective feeding another one is masked first
     llvm::SmallVector<llvm::CallInst *, 16> Calls;
     for (auto *BB : llvm::ReversePostOrderTraversal<llvm::Function *>(&F))
       for (auto &I : *BB)
         if (auto *C = asCollective(&I))
           Calls.push_back(C);
+    bool FChanged = false;
     for (auto *C : Calls)
       while (Masker{F}.maskOnce(*C)) // fresh analyses after every change of the CFG
-        ;
-    FAM.invalidate(F, llvm::PreservedAnalyses::none());
+        FChanged = true;
+    if (FChanged)
+      FAM.invalidate(F, llvm::PreservedAnalyses::none());
+    Changed |= FChanged;
   }
   return Changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
 }

@@ -1,18 +1,16 @@
 // RUN: %acpp %s -o %t --acpp-targets=generic
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_APPDB_DIR=%t.db ACPP_DEBUG_LEVEL=3 %t 2>&1 | FileCheck %s --check-prefixes=CHECK,RESULT
-// RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_APPDB_DIR=%t.db ACPP_S2_SUBGROUP_STEPS=0 %t | FileCheck %s --check-prefix=RESULT
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefix=RESULT
 // RUN: %if rv %{ rm -rf %t.db %}
 // RUN: %if rv %{ env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db ACPP_DEBUG_LEVEL=3 %t 2>&1 | FileCheck %s --check-prefixes=VEC,RESULT %}
 // RUN: %if rv %{ rm -rf %t.db %}
 // RUN: %if rv %{ env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=4 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefix=RESULT %}
 
-// SubgroupStepsPass (SSCP host, S > 1): each sub-group collective runs as one vector step per
-// sub-group; independent collectives of one block share one step. Work-groups of 12 at S = 8 give
-// sub-groups of 8 and 4 lanes. Results must match the builtins' (ACPP_S2_SUBGROUP_STEPS=0).
+// Every kind of sub-group collective (SSCP host, S > 1), several in one block and in a chain, on
+// the scalar path (per-lane builtins). Work-groups of 12 at S = 8 give sub-groups of 8 and 4 lanes.
 // Built with RV (lit feature rv), the same kernels also run vectorized (SubgroupVectorizerPass:
-// the collectives as V1's vector operations); prefix VEC checks that the pass vectorized them.
+// the collectives as SubgroupOps.hpp's vector operations); prefix VEC checks that the pass
+// vectorized them.
 
 #include <algorithm>
 #include <climits>
@@ -57,7 +55,6 @@ template <class T, class G, class Op> T fold(int i0, int m, G g, T init, Op op) 
 }
 
 // all kinds in one block, no collective uses another's result: one step
-// CHECK: [SubgroupSteps] {{.*}}9steps_int{{.*}}: 19 collective(s), one sub-group step
 // VEC: [SubgroupVectorizer] {{.*}}steps_intRN{{.*}}: vectorized at width 8
 // RESULT: steps_int: ok
 void steps_int(sycl::queue &q) {
@@ -111,7 +108,6 @@ void steps_int(sycl::queue &q) {
 }
 
 // unsigned (min / max must compare unsigned) and float (same combine order as the builtins)
-// CHECK: [SubgroupSteps] {{.*}}8steps_uf{{.*}}: 10 collective(s), one sub-group step
 // VEC: [SubgroupVectorizer] {{.*}}steps_ufRN{{.*}}: vectorized at width 8
 // RESULT: steps_uf: ok
 void steps_uf(sycl::queue &q) {
@@ -154,8 +150,6 @@ void steps_uf(sycl::queue &q) {
 
 // b uses a's result but is pure: it moves after c, so a and c share a step; the reduce needs b:
 // a second step
-// CHECK: [SubgroupSteps] {{.*}}11steps_chain{{.*}}: 2 collective(s), one sub-group step
-// CHECK: [SubgroupSteps] {{.*}}11steps_chain{{.*}}: 1 collective(s), one sub-group step
 // VEC: [SubgroupVectorizer] {{.*}}steps_chainRN{{.*}}: vectorized at width 8
 // RESULT: steps_chain: ok
 void steps_chain(sycl::queue &q) {

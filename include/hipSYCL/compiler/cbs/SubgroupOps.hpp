@@ -18,9 +18,9 @@
 
 namespace hipsycl::compiler {
 // The sub-group collectives as vector operations on the S lanes of a sub-group, in the builtins'
-// order of operations (results as the per-lane builtins). Used by the scalar path's sub-group
-// steps (SubgroupSteps.hpp) and by the RV path (SubgroupVectorizerPass). Op: the
-// __acpp_sscp_algorithm_op; Class: from the builtin's name.
+// order of operations (results as the per-lane builtins). Used by the RV path
+// (SubgroupVectorizerPass); MaskDivergentSubgroupCollectivesPass takes parse() and identity().
+// Op: the __acpp_sscp_algorithm_op; Class: from the builtin's name.
 namespace sgops {
 struct Collective { // a supported builtin: __acpp_sscp_sub_group_<kind>_<type>, or any / all / none
   enum Kind { Shl, Shr, Permute, Select, Broadcast, Reduce, InclusiveScan, ExclusiveScan, Any, All, None };

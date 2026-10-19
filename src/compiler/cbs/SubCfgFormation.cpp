@@ -12,7 +12,6 @@
 
 #include "hipSYCL/compiler/cbs/IRUtils.hpp"
 #include "hipSYCL/compiler/cbs/SplitterAnnotationAnalysis.hpp"
-#include "hipSYCL/compiler/cbs/SubgroupSteps.hpp"
 #include "hipSYCL/compiler/cbs/UniformityAnalysis.hpp"
 
 #include "hipSYCL/compiler/utils/LLVMUtils.hpp"
@@ -1863,20 +1862,6 @@ void formSubCfgs(llvm::Function &F, llvm::LoopInfo &LI, llvm::DominatorTree &DT,
                   NewExit, LocalSize, IsSscp, SG ? Phase.Begin : nullptr,
                   SG ? Phase.End : nullptr);
     purgeLifetime(Cfg);
-  }
-
-  // a sub-group step marker starts the span after its sub-group barrier: run it once per
-  // sub-group, in the span's preheader before the lanes (SubgroupSteps.hpp)
-  for (auto *Cfg : SgSpans) {
-    llvm::SmallVector<llvm::CallInst *, 4> Markers;
-    for (auto *BB : Cfg->getNewBlocks())
-      for (auto &I : *BB)
-        if (auto *C = llvm::dyn_cast<llvm::CallInst>(&I);
-            C && C->getCalledFunction() &&
-            C->getCalledFunction()->getName().starts_with(StepMarkerPrefix))
-          Markers.push_back(C);
-    for (auto *C : Markers)
-      emitSubgroupStep(*C, Cfg->getEntry()->getTerminator(), Phase.Begin, Phase.End, SubgroupSize);
   }
 
   if (SgSpans.empty()) {
