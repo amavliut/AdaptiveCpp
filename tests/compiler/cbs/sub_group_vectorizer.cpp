@@ -1,18 +1,18 @@
 // REQUIRES: rv
 // RUN: %acpp %s -o %t --acpp-targets=generic
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db ACPP_DEBUG_LEVEL=3 %t 2>&1 | FileCheck %s --check-prefixes=RV,OK,VEC
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db ACPP_DEBUG_LEVEL=3 %t 2>&1 | FileCheck %s --check-prefixes=RV,OK
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=4 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefixes=OK,VEC
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=4 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefix=OK
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=16 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefixes=OK,VEC
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=16 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefix=OK
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=0 ACPP_APPDB_DIR=%t.db %t scalar | FileCheck %s --check-prefix=OK
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=0 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefix=OK
 
 // SubgroupVectorizerPass (SSCP host, built WITH_RV, ACPP_OPENMP_VECTORIZE=1): a kernel runs one
 // sub-group per SIMD vector. Check prefixes: RV (the pass vectorized the kernel or kept it scalar,
-// and why), OK (results right with and without vectorization), VEC (vectorized only: a collective
-// reached by part of a sub-group is beyond the scalar path's hoisting). `scalar` skips the VEC kernels.
+// and why), OK (results right with and without vectorization; a collective reached by part of a
+// sub-group is masked on both paths).
 
 #include <algorithm>
 #include <cmath>
@@ -109,7 +109,7 @@ void vec_div_loop(sycl::queue &q, In in) { // lane-dependent trip count: runs wh
 }
 
 // RV: [SubgroupVectorizer] {{.*}}vec_div_reduceRN{{.*}}: vectorized at width 8
-// VEC: vec_div_reduce: ok
+// OK: vec_div_reduce: ok
 void vec_div_reduce(sycl::queue &q, In in) { // reduce by part of the sub-group: others add 0
   check(q, "vec_div_reduce", [=](sycl::handler &h, float *o) {
     h.parallel_for(sycl::nd_range<1>{N, WG}, [=](sycl::nd_item<1> it) {
@@ -477,8 +477,7 @@ void vec_wg_reduce(sycl::queue &q, In in) { // work-group collectives: not mappe
   });
 }
 
-int main(int argc, char **) {
-  const bool Scalar = argc > 1; // skip the VEC kernels
+int main() {
   sycl::queue q;
   float *x = sycl::malloc_shared<float>(N, q), *y = sycl::malloc_shared<float>(N, q);
   sycl::float2 *xy = sycl::malloc_shared<sycl::float2>(N, q);
@@ -492,8 +491,7 @@ int main(int argc, char **) {
   vec_shift_reduce(q, in);
   vec_div_store(q, in);
   vec_div_loop(q, in);
-  if (!Scalar)
-    vec_div_reduce(q, in);
+  vec_div_reduce(q, in);
   vec_local_barrier(q, in);
   vec_2d(q, in);
   vec_float2_local(q, in);

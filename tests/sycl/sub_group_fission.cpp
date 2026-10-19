@@ -229,7 +229,7 @@ BOOST_AUTO_TEST_CASE(sg_uniform_counter_across_turns) {
   }
 }
 
-// HoistDivergentSubgroupCollectivesPass: collectives called by only some lanes of a sub-group
+// MaskDivergentSubgroupCollectivesPass: collectives called by only some lanes of a sub-group
 // (undefined in SYCL, works on GPUs, used by GROMACS). Reductions, scans and votes must cover
 // exactly the lanes that took the branch (here lanes 0-2 of each sub-group).
 BOOST_AUTO_TEST_CASE(sg_lane_divergent_collectives) {
@@ -261,7 +261,7 @@ BOOST_AUTO_TEST_CASE(sg_lane_divergent_collectives) {
   }
 }
 
-// HoistDivergentSubgroupCollectivesPass, GROMACS's shift-force shape: two shuffles under a
+// MaskDivergentSubgroupCollectivesPass, GROMACS's shift-force shape: two shuffles under a
 // lane-dependent branch (rows 0-2 of a 5x5 work-group, so a sub-group can straddle rows 2 and 3),
 // then a collective by all lanes, which must still see a sub-group in step.
 BOOST_AUTO_TEST_CASE(sg_lane_divergent_shuffles) {

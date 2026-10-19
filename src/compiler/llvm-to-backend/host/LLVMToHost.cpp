@@ -19,7 +19,7 @@
 #include "hipSYCL/compiler/cbs/SubgroupSteps.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/AddressSpaceMap.hpp"
 #include "hipSYCL/compiler/llvm-to-backend/Utils.hpp"
-#include "hipSYCL/compiler/llvm-to-backend/host/HoistDivergentSubgroupCollectivesPass.hpp"
+#include "hipSYCL/compiler/llvm-to-backend/host/MaskDivergentSubgroupCollectivesPass.hpp"
 #ifdef ACPP_WITH_RV
 #include "hipSYCL/compiler/llvm-to-backend/host/SubgroupVectorizerPass.hpp"
 #endif
@@ -176,9 +176,7 @@ bool LLVMToHostTranslator::toBackendFlavor(llvm::Module &M, PassHandler &PH) {
                            KernelNames}.run(M, *PH.ModuleAnalysisManager);
 #endif
   if (getSubgroupSize() > 1) {
-    HoistDivergentSubgroupCollectivesPass HoistPass{
-        getSubgroupSize(), {KnownGroupSizeX, KnownGroupSizeY, KnownGroupSizeZ}};
-    HoistPass.run(M, *PH.ModuleAnalysisManager);
+    MaskDivergentSubgroupCollectivesPass{}.run(M, *PH.ModuleAnalysisManager);
     // collectives stay calls until CBS runs each as one vector step per sub-group
     // (SubgroupSteps.hpp); ACPP_S2_SUBGROUP_STEPS=0 keeps the per-lane builtins
     if (getEnvironmentVariableOrDefault<int>("SUBGROUP_STEPS", 1))

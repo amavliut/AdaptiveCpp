@@ -1,13 +1,13 @@
 // REQUIRES: rv
 // RUN: %acpp %s -o %t --acpp-targets=generic
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db ACPP_DEBUG_LEVEL=3 %t 2>&1 | FileCheck %s --check-prefixes=RV,OK,VEC
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=1 ACPP_APPDB_DIR=%t.db ACPP_DEBUG_LEVEL=3 %t 2>&1 | FileCheck %s --check-prefixes=RV,OK
 // RUN: rm -rf %t.db
-// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=0 ACPP_APPDB_DIR=%t.db %t scalar | FileCheck %s --check-prefix=OK
+// RUN: env ACPP_VISIBILITY_MASK=omp ACPP_OPENMP_SUBGROUP_SIZE=8 ACPP_OPENMP_VECTORIZE=0 ACPP_APPDB_DIR=%t.db %t | FileCheck %s --check-prefix=OK
 
 // SubgroupVectorizerPass on two shapes of GROMACS's nbnxm force kernel (nbnxm_sycl_kernel_body.h,
-// 4 x 4 work-groups, S = 8: a sub-group spans two rows). RV, OK, VEC as in
-// sub_group_vectorizer.cpp; `scalar` skips the VEC kernel.
+// 4 x 4 work-groups, S = 8: a sub-group spans two rows). RV and OK as in
+// sub_group_vectorizer.cpp.
 
 #include <cmath>
 #include <cstdio>
@@ -33,7 +33,7 @@ std::vector<float> inputs() {
 // reduceForceJShuffle in the divergent j-loop (`if (!maskSet) continue;`, one mask per row):
 // shuffles reached by one row of the sub-group only; lanes tidxi < 3 read their own row
 // RV: [SubgroupVectorizer] {{.*}}gmx_shuffleRN{{.*}}: vectorized at width 8, 2 sub-groups per work-group
-// VEC: gmx_shuffle: ok
+// OK: gmx_shuffle: ok
 void gmx_shuffle(sycl::queue &q) {
   const auto X = inputs();
   std::vector<float> Out(G * JM * 3, 0.f);
@@ -164,9 +164,8 @@ void gmx_iforce(sycl::queue &q) {
   report("gmx_iforce", Bad);
 }
 
-int main(int argc, char **) {
+int main() {
   sycl::queue q;
-  if (argc == 1) // the scalar path can't hoist shuffles out of a data-dependent loop
-    gmx_shuffle(q);
+  gmx_shuffle(q);
   gmx_iforce(q);
 }
