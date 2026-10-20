@@ -292,4 +292,45 @@ BOOST_AUTO_TEST_CASE(sg_lane_divergent_shuffles) {
   }
 }
 
+// MaskDivergentSubgroupCollectivesPass, GROMACS's nonbonded shape at S = 64: a lane-dependent
+// `continue` skips a whole inner loop holding shuffles (here per quad of lanes), with another
+// `continue` inside. The first lane of a quad sums its quad, whatever the other quads do.
+BOOST_AUTO_TEST_CASE(sg_lane_divergent_loop) {
+  sycl::queue q;
+  if (q.get_device().get_backend() != sycl::backend::omp)
+    return;
+  const int S = sg_size(q), W = 32, nk = S > 0 ? 2 : 3; // inner trip count unknown at compile time
+  const auto quad = [](int j, int lid, int g) { return (j * 5 + lid / 4 * 3 + g) % 4; };
+  auto v = run(q, sycl::range<1>{W}, 1, [=](auto it, int *o) {
+    auto sg = it.get_sub_group();
+    const int lid = it.get_local_linear_id(), g = it.get_group_linear_id();
+    int acc = 0;
+    for (int j = 0; j < 6; ++j) {
+      const int m = quad(j, lid, g);
+      if (!m)
+        continue;
+      for (int k = 0; k < nk; ++k) {
+        if (!((m >> k) & 1))
+          continue;
+        int f = (j + 1) * (k + 1) + lid;
+        f += sycl::shift_group_left(sg, f, 1);
+        f += sycl::shift_group_left(sg, f, 2);
+        acc += f;
+      }
+    }
+    o[0] = acc;
+  });
+  for (std::size_t i = 0; i < v.size(); ++i) {
+    const int lid = i % W, g = i / W;
+    if (lid % 4 || S < 4) // defined for the first lane of a quad inside one sub-group
+      continue;
+    int e = 0;
+    for (int j = 0; j < 6; ++j)
+      for (int k = 0; k < nk; ++k)
+        if (quad(j, lid, g) >> k & 1)
+          e += 4 * (j + 1) * (k + 1) + 4 * lid + 6;
+    BOOST_TEST(v[i] == e);
+  }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

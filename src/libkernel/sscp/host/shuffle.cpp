@@ -10,6 +10,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #include "hipSYCL/sycl/libkernel/sscp/builtins/shuffle.hpp"
+#include "hipSYCL/sycl/libkernel/sscp/builtins/collpredicate.hpp"
 #include "hipSYCL/sycl/libkernel/sscp/builtins/barrier.hpp"
 #include "hipSYCL/sycl/libkernel/sscp/builtins/subgroup.hpp"
 
@@ -26,7 +27,7 @@ void sg_barrier() {
 }
 
 // Value of lane `src` (modulo the sub-group size) of the caller's sub-group.
-// All host sub-group collectives (broadcast, reduce, scan, any/all) build on this.
+// The host sub-group collectives (broadcast, reduce, scan) build on this; votes use sg_vote.
 template <class T> T sg_shuffle(T value, __acpp_uint32 src) {
   const __acpp_uint32 s = __acpp_sscp_get_subgroup_max_size();
   if (s == 1) // only lane 0 exists
@@ -41,7 +42,35 @@ template <class T> T sg_shuffle(T value, __acpp_uint32 src) {
   sg_barrier(); // all lanes have read before the next shuffle reuses scratch
   return result;
 }
+
+// any (all = false) or all of the caller's sub-group: every lane writes its flag, then reads
+// them all. Two barriers, where a reduction over shuffles takes 2 log2(S) + 2.
+bool sg_vote(bool pred, bool all) {
+  const __acpp_uint32 s = __acpp_sscp_get_subgroup_max_size();
+  if (s == 1)
+    return pred;
+  auto *flags = static_cast<unsigned char *>(__acpp_sscp_host_get_internal_local_memory()) +
+                sg_scratch_offset + __acpp_sscp_get_subgroup_id() * s;
+  flags[__acpp_sscp_get_subgroup_local_id()] = pred;
+  sg_barrier(); // all lanes have written
+  unsigned char any = 0, every = 1;
+  for (__acpp_uint32 i = 0, n = __acpp_sscp_get_subgroup_size(); i < n; ++i) {
+    any |= flags[i];
+    every &= flags[i];
+  }
+  sg_barrier(); // all lanes have read before the next collective reuses scratch
+  return all ? every : any;
+}
 } // namespace
+
+HIPSYCL_SSCP_CONVERGENT_BUILTIN
+bool __acpp_sscp_sub_group_any(bool pred) { return sg_vote(pred, false); }
+
+HIPSYCL_SSCP_CONVERGENT_BUILTIN
+bool __acpp_sscp_sub_group_all(bool pred) { return sg_vote(pred, true); }
+
+HIPSYCL_SSCP_CONVERGENT_BUILTIN
+bool __acpp_sscp_sub_group_none(bool pred) { return !sg_vote(pred, false); }
 
 // in one macro generate shuffle, shift right, permute, and select
 #define ACPP_HOST_SUBGROUP_SHUFFLES(N)                                                             \
