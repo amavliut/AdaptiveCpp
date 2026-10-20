@@ -33,8 +33,7 @@ llvm::Value *combine(llvm::IRBuilder<> &B, unsigned Op, char Class, llvm::Value 
 llvm::Constant *identity(unsigned Op, char Class, llvm::Type *T); // x op identity = x
 llvm::Constant *laneIds(llvm::Type *T, unsigned S);
 llvm::Value *shuffle(llvm::IRBuilder<> &B, Collective::Kind K, llvm::Value *X, llvm::Value *P, unsigned S);
-llvm::Value *reduce(llvm::IRBuilder<> &B, unsigned Op, char Class, llvm::Value *V, llvm::Value *N,
-                    unsigned S);
+llvm::Value *reduce(llvm::IRBuilder<> &B, unsigned Op, char Class, llvm::Value *V, unsigned S);
 llvm::Value *inclusiveScan(llvm::IRBuilder<> &B, unsigned Op, char Class, llvm::Value *V, unsigned S);
 llvm::Value *exclusiveScan(llvm::IRBuilder<> &B, unsigned Op, char Class, llvm::Value *V,
                            llvm::Value *Init, unsigned S);

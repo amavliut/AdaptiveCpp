@@ -129,14 +129,14 @@ Value *shuffle(IRBuilder<> &B, Collective::Kind K, Value *X, Value *P, unsigned 
   return R;
 }
 
-// as sg_reduce_impl: for d = S/2 .. 1, lane j combines lane j + d if j + d < n; lane 0's value
-// goes to every lane
-Value *reduce(IRBuilder<> &B, unsigned Op, char Class, Value *V, Value *N, unsigned S) {
-  auto *Lanes = laneIds(N->getType(), S);
+// as sg_reduce_impl: for d = S/2 .. 1, lane j combines lane j + d if j + d < S (missing or
+// inactive lanes hold the identity); lane 0's value goes to every lane
+Value *reduce(IRBuilder<> &B, unsigned Op, char Class, Value *V, unsigned S) {
+  auto *Lanes = laneIds(B.getInt32Ty(), S);
   for (unsigned D = S / 2; D > 0; D /= 2) {
     Value *Other = permute(B, V, S, [&](int J) { return (J + D) % S; });
     Value *Valid = B.CreateICmpULT(B.CreateAdd(Lanes, ConstantInt::get(Lanes->getType(), D)),
-                                   B.CreateVectorSplat(S, N));
+                                   ConstantInt::get(Lanes->getType(), S));
     V = B.CreateSelect(Valid, combine(B, Op, Class, V, Other), V);
   }
   return B.CreateVectorSplat(S, B.CreateExtractElement(V, uint64_t(0)));

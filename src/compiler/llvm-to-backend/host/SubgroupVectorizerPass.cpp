@@ -132,7 +132,7 @@ Value *KernelVectorizer::collective(IRBuilder<> &B, const sgops::Collective &Col
       X = VB.CreateSelect(V->getArg(Args.size()), X,
                           ConstantVector::getSplat(ElementCount::getFixed(S),
                                                    sgops::identity(Op, Coll.Class, C.getType())));
-      R = Coll.K == Kind::Reduce          ? sgops::reduce(VB, Op, Coll.Class, X, VB.getInt64(S), S)
+      R = Coll.K == Kind::Reduce          ? sgops::reduce(VB, Op, Coll.Class, X, S)
           : Coll.K == Kind::InclusiveScan ? sgops::inclusiveScan(VB, Op, Coll.Class, X, S)
                                           : sgops::exclusiveScan(VB, Op, Coll.Class, X, V->getArg(1), S);
     } else
@@ -165,7 +165,6 @@ std::array<Value *, 3> KernelVectorizer::localIds(IRBuilder<> &B, Value *SgFirst
 // Replaces the SSCP builtins in Lane, whose last NumIdArgs arguments are the ids. False if one is
 // not supported (work-group collectives, sub-group ones other than below, unknown queries).
 bool KernelVectorizer::rewriteBuiltins(Function &Lane) {
-  auto &Ctx = M.getContext();
   Value *Arg[NumIdArgs];
   for (unsigned I = 0; I < NumIdArgs; ++I)
     Arg[I] = Lane.getArg(Lane.arg_size() - NumIdArgs + I);
