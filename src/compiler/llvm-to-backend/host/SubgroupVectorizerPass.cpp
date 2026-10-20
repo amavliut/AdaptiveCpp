@@ -915,8 +915,10 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     FPM.addPass(ScalarizerPass(ScalarizeAll));
     FPM.addPass(InstCombinePass(InstCombineOptions().setVerifyFixpoint(false)));
     FPM.addPass(LoopSimplifyPass());
-    FPM.addPass(LCSSAPass());
     FPM.addPass(BreakCriticalEdgesPass());
+    // after the edge splits: they move loop exits, and RV keeps each lane's value at its exit in
+    // the exit blocks' LCSSA phis (else a value used after a divergent loop becomes undef)
+    FPM.addPass(LCSSAPass());
     FPM.run(*Lane, FAM);
     FAM.invalidate(*Lane, PreservedAnalyses::none());
     LoopExitCanonicalizer(FAM.getResult<LoopAnalysis>(*Lane)).canonicalize(*Lane);
@@ -953,6 +955,9 @@ bool KernelVectorizer::run(FunctionAnalysisManager &FAM) {
     rv::FunctionRegion FR(*Lane);
     rv::Region R(FR);
     rv::VectorizationInfo VecInfo(R, Mapping);
+    for (auto &I : instructions(*Lane)) // RV has no shape rule for these unless varying (asserts)
+      if (isa<PtrToIntInst, IntToPtrInst>(I))
+        VecInfo.setPinnedShape(I, rv::VectorShape::varying());
     for (auto *C : UniformCalls) // barriers have side effects: RV would call them once per lane
       VecInfo.setPinnedShape(*C, rv::VectorShape::uni());
     for (auto *I : Pinned) // lane-invariant 
