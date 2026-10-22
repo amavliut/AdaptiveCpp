@@ -527,18 +527,11 @@ unsigned KernelVectorizer::lowerPrivateMemsets(Function &Lane) {
   return Lowered;
 }
 
-// Periodic and contiguous accesses. Each lane reads element i*4 + lid.x of GROMACS's xqib, an
-// array of float4 {x, y, z, q}. At S = 8 in 4x4 work-groups lid.x = <0,1,2,3,0,1,2,3>, which RV
-// calls varying, so it emits one gather per field:
-//   x = gather(&x8, &x9, &x10, &x11, &x8, &x9, &x10, &x11),  y = gather(&y8, ...),  z, q likewise
-// The lanes' addresses differ from lane 0's by known constants within a small range, so one load
-// of that range, shuffled into one vector per field, replaces the 4 gathers:
-//   memory  x8 y8 z8 q8 | x9 y9 z9 q9 | x10 y10 z10 q10 | x11 y11 z11 q11   (floats 0..15)
-//   W = load 16 floats at &x8
-//   x = shuffle(W, <0,4,8,12,0,4,8,12>),  y = shuffle(W, <1,5,9,13,...>),  z, q likewise
-// The window holds at most 2S elements. Gathers share one if they have the same base and mask, in
-// one block with no write between them; under a mask it loads only the elements active lanes read.
-// A scatter writing distinct elements becomes a shuffle and one masked store.
+// turn slow per-lane memory accesses into one plain load or store plus shuffles
+// memory:  x8 y8 z8 q8 | x9 y9 z9 q9 | x10 … | x11 y11 z11 q11      (16 floats)
+// before:  x = gather(&x8,&x9,&x10,&x11,&x8,&x9,&x10,&x11);  y, z, q: 3 more gathers
+// after:   W = load 16 floats at &x8
+//          x = shuffle(W, <0,4,8,12, 0,4,8,12>);  y = shuffle(W, <1,5,9,13, …>);  …
 std::array<unsigned, 4> KernelVectorizer::windowAccesses(Function &V) {
   const auto &DL = M.getDataLayout();
   LaneValues Values(V.getArg(K.arg_size()), S, W);
@@ -672,8 +665,7 @@ std::array<unsigned, 4> KernelVectorizer::windowAccesses(Function &V) {
     A.T = cast<VectorType>((Gather ? C : C->getArgOperand(0))->getType())->getElementType();
     A.A = cast<ConstantInt>(C->getArgOperand(Gather ? 1 : 2))->getAlignValue();
     A.B.assign(S, 0);
-    if (DL.getTypeStoreSize(A.T) != DL.getTypeAllocSize(A.T) || !Walk(A.Ptr, A) ||
-        isa<AllocaInst>(getUnderlyingObject(A.Root)))
+    if (DL.getTypeStoreSize(A.T) != DL.getTypeAllocSize(A.T) || !Walk(A.Ptr, A))
       return std::nullopt;
     return A;
   };
