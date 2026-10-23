@@ -132,14 +132,16 @@ class Masker {
     }
   }
 
-  // the instructions from S on, which the lanes skipping the `if` around S won't have run
+  // the values defined from S on, which the lanes skipping the `if` around S won't have; no
+  // instructions without a value: enterLoop erases branches in the region before repairSSA
   llvm::SmallVector<llvm::Instruction *, 64> regionOf(llvm::BasicBlock *S) const {
     llvm::SmallVector<llvm::BasicBlock *, 16> Blocks;
     DT.getDescendants(S, Blocks);
     llvm::SmallVector<llvm::Instruction *, 64> Insts;
     for (auto *X : Blocks)
       for (auto &I : *X)
-        Insts.push_back(&I);
+        if (!I.getType()->isVoidTy())
+          Insts.push_back(&I);
     return Insts;
   }
 
