@@ -213,6 +213,32 @@ void vec_float2_loop(sycl::queue &q, In in) { // float2 carried across iteration
   });
 }
 
+// a float2 assigned before a loop and read in it, as GROMACS's ljCombJ: clang copies it as one
+// i64, so RV keeps one copy per lane (8 bytes apart), written by scatters and read field by field
+// with gathers of stride 8: all become window stores / loads (in.x[(i + k) % N] stays a gather)
+// RV: [SubgroupVectorizer] {{.*}}vec_private_copyRN{{.*}}: {{.*}} {{[1-9][0-9]*}} of {{[0-9]+}} gather(s) and [[S:[1-9][0-9]*]] of [[S]] scatter(s)
+// OK: vec_private_copy: ok
+void vec_private_copy(sycl::queue &q, In in) {
+  check(q, "vec_private_copy", [=](sycl::handler &h, float *o) {
+    h.parallel_for(sycl::nd_range<1>{N, WG}, [=](sycl::nd_item<1> it) {
+      const size_t i = it.get_global_id(0);
+      sycl::float2 c;
+      c = in.xy[i / 4];
+      float Sum = 0;
+      for (size_t k = 0; k < 4; ++k)
+        if (in.x[(i + k) % N] > 4.f)
+          Sum += c[0] * float(k + 1) + 10.f * c[1];
+      o[i] = Sum;
+    });
+  }, [=](size_t i, size_t) -> Opt {
+    float Sum = 0;
+    for (size_t k = 0; k < 4; ++k)
+      if (in.x[(i + k) % N] > 4.f)
+        Sum += in.x[i / 4] * float(k + 1) + 10.f * in.y[i / 4];
+    return Sum;
+  });
+}
+
 // a private array with an aggregate initializer (a 24-byte memset `align 16`): RV keeps one copy
 // per lane, 24 bytes apart, so the pass lowers the alignment (else aligned stores fault)
 // RV: [SubgroupVectorizer] {{.*}}vec_private_arrayRN{{.*}}: vectorized at width 8
@@ -461,6 +487,20 @@ void vec_partial_2d(sycl::queue &q, In in) { // 5 x 5 work-groups: sub-groups cr
   });
 }
 
+// pointers as integers: RV has no shape rule for ptrtoint / inttoptr of a uniform or strided
+// pointer (asserts), so the pass pins them varying
+// RV: [SubgroupVectorizer] {{.*}}vec_ptrtointRN{{.*}}: vectorized at width 8
+// OK: vec_ptrtoint: ok
+void vec_ptrtoint(sycl::queue &q, In in) {
+  auto bits = [](const void *p) { return float((reinterpret_cast<uintptr_t>(p) >> 2) & 7); };
+  check(q, "vec_ptrtoint", [=](sycl::handler &h, float *o) {
+    h.parallel_for(sycl::nd_range<1>{N, WG}, [=](sycl::nd_item<1> it) {
+      const size_t i = it.get_global_id(0);
+      o[i] = bits(in.x) + 8.f * bits(&in.y[i]);
+    });
+  }, [=](size_t i, size_t) -> Opt { return bits(in.x) + 8.f * bits(&in.y[i]); });
+}
+
 // RV: [SubgroupVectorizer] {{.*}}vec_wg_reduceRN{{.*}} stays scalar: __acpp_sscp_work_group_reduce_f32 is not supported
 // OK: vec_wg_reduce: ok
 void vec_wg_reduce(sycl::queue &q, In in) { // work-group collectives: not mapped
@@ -496,6 +536,7 @@ int main() {
   vec_2d(q, in);
   vec_float2_local(q, in);
   vec_float2_loop(q, in);
+  vec_private_copy(q, in);
   vec_private_array(q, in);
   vec_private_accum(q, in);
   vec_reverse(q, in);
@@ -505,6 +546,7 @@ int main() {
   vec_partial(q, in);
   vec_partial_barrier(q, in);
   vec_partial_2d(q, in);
+  vec_ptrtoint(q, in);
   vec_wg_reduce(q, in);
   sycl::free(x, q);
   sycl::free(y, q);
